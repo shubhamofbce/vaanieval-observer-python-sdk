@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vaanieval-observer"
+version = "0.1.0"
+description = "Framework-independent voice-call observability SDK"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+keywords = ["voice", "observability", "telemetry", "audio", "livekit"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Monitoring",
+    "License :: OSI Approved :: MIT License",
+]
+dependencies = []
+
+[project.optional-dependencies]
+# The SDK instruments these when they are present but never requires them.
+httpx = ["httpx>=0.24"]
+aiohttp = ["aiohttp>=3.9"]
+livekit = ["livekit-agents>=1.0"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "httpx>=0.24", "aiohttp>=3.9"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vaani_observer"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["error::RuntimeWarning"]

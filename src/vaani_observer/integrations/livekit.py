@@ -42,13 +42,22 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
+
+from .._diagnostics import warn_once
 
 logger = logging.getLogger("vaani_observer.livekit")
 
 # Cleanup of a provider iterator is best-effort: a stalled provider must never
 # be the reason a call fails to shut down.
 _CLOSE_TIMEOUT_S = 5.0
+
+# Whole-upload budget when the caller does not set one. It exists because the
+# usual caller is a LiveKit shutdown hook racing `shutdown_process_timeout`
+# (10s by default, and the docs ask for 120s): with no budget the retry policy
+# can spend minutes on a single leg and be killed anyway, having made the tail
+# worse than no retries at all. Pass `upload_timeout=0` for no budget.
+DEFAULT_FINISH_UPLOAD_TIMEOUT_S = 60.0
 
 __all__ = [
     "VaaniLiveKitRecorder",
@@ -183,8 +192,11 @@ class VaaniLiveKitRecorder:
         input_sample_rate: int = 24000,
         output_sample_rate: int = 24000,
         channels: int = 1,
+        model_overrides: Optional[Dict[str, str]] = None,
     ) -> None:
         self._observer = observer
+        #: Why recording is off, when it is off despite being asked for.
+        self.last_error: Optional[str] = None
         self._upload = upload
         self._capture_transcripts = capture_transcripts
         self._input_format = {
@@ -203,6 +215,7 @@ class VaaniLiveKitRecorder:
                 self.call = observer.start_session(agent_id=agent_id, metadata=metadata or {})
             except Exception as error:  # noqa: BLE001 - never block the call
                 logger.error("vaani: start_session failed (%s); recording disabled", error)
+                self.last_error = f"{type(error).__name__}: {error}"
 
         # `_turns` is an index, not the population: one state is registered
         # under both its own id and the LiveKit speech id that adopted it.
@@ -211,6 +224,12 @@ class VaaniLiveKitRecorder:
         self._all_turns: List[_TurnState] = []
         self._pending_turn: Optional[_TurnState] = None
         self._current_turn: Optional[_TurnState] = None
+        # The turn whose reply is being synthesized, which is *not* the same as
+        # the turn being served: a caller who speaks while the agent is still
+        # talking advances `_current_turn` mid-reply. Attributing agent PCM to
+        # `_current_turn` therefore credited the interrupting turn -- measured on
+        # a real call as a TTS span reporting 18920 ms of audio and 480 bytes.
+        self._speaking_turn: Optional[_TurnState] = None
         self._pending_stt = _PendingStt()
         # STT metrics are emitted per provider request, not per utterance, so a
         # turn whose metric arrived during an earlier utterance would otherwise
@@ -220,7 +239,23 @@ class VaaniLiveKitRecorder:
         self._outcome: Optional[str] = None
         self._turn_counter = 0
         self._sockets: List[Any] = []
-        self._attached: List[Any] = []
+        # (session, event name, wrapped handler). The *wrapped* reference has to
+        # be kept or `session.off()` is impossible: LiveKit matches listeners by
+        # identity, and what was registered is the wrapper, not the bound method.
+        self._attached: List[tuple] = []
+        # Failure classes already reported. Recording is best effort, but the
+        # first occurrence of each distinct failure must be visible: three
+        # different real bugs used to present identically as "it records
+        # nothing" because every one of them was logged at DEBUG.
+        self._warned: "set[str]" = set()
+        # An explicit label always wins over anything reported or sniffed: the
+        # operator knows what they deployed.
+        self._model_overrides: Dict[str, str] = dict(model_overrides or {})
+        self._sniffed_models: Dict[str, str] = {}
+        # The rate a provider actually used, learned from the first tapped
+        # frame. The constructor values are only a default for spans that are
+        # written before any audio has been seen.
+        self._observed_rates: Dict[str, int] = {}
 
     # --------------------------------------------------------------- factory
 
@@ -236,8 +271,21 @@ class VaaniLiveKitRecorder:
             return cls(None, **overrides)
         try:
             from .. import VaaniObserver
+            from ..observer import upload_options_from_env
 
-            endpoints = overrides.pop("endpoints", None) or []
+            endpoints = overrides.pop("endpoints", None) or _env_endpoints()
+            # Patching httpx and aiohttp costs something on every request and
+            # buys nothing without rules to match against: `_begin` opens a span
+            # only on a rule hit. Leaving them on with an empty rule set is how
+            # an adopter concludes "auto HTTP capture is broken" when in fact it
+            # was never asked to capture anything.
+            #
+            # Defaults are deliberately *not* shipped. A rule of type "llm"
+            # pointed at api.openai.com would open a second LLM operation
+            # alongside the one derived from `metrics_collected`, double-counting
+            # tokens and latency in every aggregate. Connection-level capture is
+            # therefore opt-in via VAANI_ENDPOINTS, and is for endpoints LiveKit
+            # metrics do not already describe.
             observer = VaaniObserver(
                 endpoint=os.environ.get("VAANI_ENDPOINT", "http://localhost:8000"),
                 api_key=os.environ.get("VAANI_API_KEY", "local-dev"),
@@ -251,20 +299,52 @@ class VaaniLiveKitRecorder:
                     "payload_max_bytes": _env_int("VAANI_PAYLOAD_MAX_BYTES", 16 * 1024),
                 },
                 endpoints=endpoints,
+                instrumentations={"http": bool(endpoints), "websocket": bool(endpoints)},
+                # Without this the documented upload-tuning table is unreachable
+                # from the only constructor the docs show, and every value an
+                # operator sets is silently discarded.
+                upload=upload_options_from_env(),
             )
         except Exception as error:  # noqa: BLE001 - observability is optional
             logger.error("vaani: disabled, failed to configure observer — %s", error)
-            return cls(None, **overrides)
+            recorder = cls(None, **overrides)
+            recorder.last_error = f"{type(error).__name__}: {error}"
+            return recorder
         overrides.setdefault("agent_id", os.environ.get("VAANI_AGENT_ID", "livekit-agent"))
         overrides.setdefault("capture_transcripts", _env_bool("VAANI_CAPTURE_STT_CONTENT", True))
         overrides.setdefault("upload", _env_bool("VAANI_UPLOAD", True))
-        return cls(observer, **overrides)
+        recorder = cls(observer, **overrides)
+        # The recorder stays inert rather than raising, because a misconfigured
+        # recorder must never be the reason a call fails to start. Staying
+        # *silent* about it is a different thing, and is how an adopter ends up
+        # with a deployment that records nothing and never finds out.
+        if not recorder.enabled:
+            logger.error(
+                "vaani: VAANI_ENABLED is set but recording is OFF — %s. "
+                "No call will be recorded until this is fixed.",
+                recorder.last_error or "the observer could not start a session",
+            )
+        return recorder
 
     # -------------------------------------------------------------- lifecycle
 
     @property
     def enabled(self) -> bool:
         return self.call is not None
+
+    def _warn_once(self, key: str, message: str, *args: Any) -> None:
+        """Report the first occurrence of a failure class, then stay quiet.
+
+        Recording is best effort, so a failing handler must not spam a
+        production log on every event. But swallowing everything at DEBUG is
+        why three distinct bugs all presented to adopters as "it just records
+        nothing". The first of each class is a warning; the rest are DEBUG.
+        """
+        if key in self._warned:
+            logger.debug("vaani: " + message, *args)
+            return
+        self._warned.add(key)
+        logger.warning("vaani: " + message, *args)
 
     def attach(self, session: Any) -> "VaaniLiveKitRecorder":
         """Subscribe to an `AgentSession`. Safe to call on an inert recorder."""
@@ -276,10 +356,10 @@ class VaaniLiveKitRecorder:
             "conversation_item_added": self._on_conversation_item,
             "function_tools_executed": self._on_tools_executed,
             # Deprecated in LiveKit 1.6 in favour of `session_usage_updated`
-            # (usage) plus `ChatMessage.metrics` (latency), but it is still the
-            # only source of per-stage duration, TTFT/TTFB and token counts.
-            # Both are subscribed to, so the spans survive its removal with
-            # only the token counts degrading.
+            # (usage) plus `ChatMessage.metrics` (latency). It remains the only
+            # source of per-stage duration, TTFT/TTFB and token counts, and
+            # `_record_llm` is reached from here and nowhere else, so LLM spans
+            # depend on it. `_on_conversation_item` builds the fallback.
             "metrics_collected": self._on_metrics,
             "session_usage_updated": self._on_usage,
             "speech_created": self._on_speech_created,
@@ -287,15 +367,74 @@ class VaaniLiveKitRecorder:
             "close": self._on_close,
         }
         for name, handler in handlers.items():
+            wrapped = _guard(self, name, handler)
             try:
-                session.on(name, _guard(handler))
+                session.on(name, wrapped)
             except Exception as error:  # noqa: BLE001 - version drift is survivable
-                logger.debug("vaani: cannot subscribe to %r (%s)", name, error)
-        self._attached.append(session)
+                self._warn_once(
+                    f"subscribe:{name}", "cannot subscribe to %r (%s)", name, error
+                )
+                continue
+            self._attached.append((session, name, wrapped))
+        self._sniff_models(session)
         return self
 
-    async def finish(self, outcome: Optional[str] = None) -> None:
-        """Finalize the local package and, when configured, upload it."""
+    def _sniff_models(self, session: Any) -> None:
+        """Learn each stage's real model from the plugin instance.
+
+        `metrics.metadata.model_name` reports the plugin's `model` *option*,
+        which for `openai.LLM.with_azure(azure_deployment=...)` is left at its
+        `"gpt-4o"` default while the real deployment goes to the client. Every
+        Azure agent therefore reports `gpt-4o` whatever it is running, and the
+        dashboard presents that as fact.
+        """
+        for kind in ("stt", "llm", "tts"):
+            try:
+                component = getattr(session, kind, None)
+                name = _sniff_model(component)
+            except Exception:  # noqa: BLE001 - a plugin property may raise
+                # This reads private attributes of third-party plugins, so it is
+                # the code most likely to meet something that throws. Observing
+                # the call must never be what ends it.
+                continue
+            if name:
+                self._sniffed_models[kind] = name
+
+    def _model_for(self, kind: str, metrics: Any) -> Optional[str]:
+        override = self._model_overrides.get(kind)
+        if override:
+            return override
+        return self._sniffed_models.get(kind) or _model(metrics)
+
+    def _detach(self) -> None:
+        """Unsubscribe every handler this recorder registered.
+
+        Without this the handlers outlive the recording: `finish()` releases the
+        call while the session keeps emitting, and every later event used to
+        dereference `None`.
+        """
+        for session, name, wrapped in self._attached:
+            off = getattr(session, "off", None)
+            if off is None:
+                continue
+            try:
+                off(name, wrapped)
+            except Exception as error:  # noqa: BLE001 - teardown must not raise
+                logger.debug("vaani: cannot unsubscribe from %r (%s)", name, error)
+        self._attached.clear()
+
+    async def finish(self, outcome: Optional[str] = None,
+                     timeout: Optional[float] = None) -> None:
+        """Finalize the local package and, when configured, upload it.
+
+        `timeout` bounds the *upload* only, and defaults to
+        `DEFAULT_FINISH_UPLOAD_TIMEOUT_S` rather than to "wait forever": the
+        usual caller is a shutdown hook on a clock. Pass `0` to remove the
+        budget. Finalization always completes, so the package is on the spool
+        and recoverable even when the network leg is abandoned — which is what
+        makes running this from a job shutdown hook survivable. See
+        `python -m vaani_observer.drain`.
+        """
         call = self.call
         if call is None:
             return
@@ -303,7 +442,11 @@ class VaaniLiveKitRecorder:
         # from the caller still wins, and "completed" is only the default when
         # nothing observed a reason at all.
         outcome = outcome or self._outcome or "completed"
+        # Releasing the call first makes every in-flight handler a clean no-op,
+        # which matters because unsubscribing is not atomic with respect to
+        # events LiveKit has already dispatched.
         self.call = None
+        self._detach()
         try:
             self.finalize_open_spans(call, outcome=outcome)
             finalized = await call.end(outcome=outcome)
@@ -314,16 +457,37 @@ class VaaniLiveKitRecorder:
                 len(self._all_turns),
                 finalized.directory,
             )
-            if self._upload and self._observer is not None:
-                result = await self._observer.upload_package(finalized)
-                logger.info(
-                    "vaani: uploaded %s status=%s operations=%s",
-                    result.get("session_id"),
-                    result.get("status"),
-                    result.get("operation_count"),
-                )
+        except Exception as error:  # noqa: BLE001 - a failed call is still a call
+            logger.warning("vaani: finalization failed — %s", error)
+            return
+        if not (self._upload and self._observer is not None):
+            return
+        if timeout is None:
+            timeout = DEFAULT_FINISH_UPLOAD_TIMEOUT_S
+        try:
+            result = await self._observer.upload_package(
+                finalized, timeout=timeout if timeout > 0 else None
+            )
+            # Leave a receipt, or a drain sidecar polling the same spool will
+            # re-ship this package -- full audio payload -- on every tick for
+            # the rest of the worker's life.
+            _mark_delivered(finalized, result, self._observer)
+            logger.info(
+                "vaani: uploaded %s status=%s operations=%s",
+                result.get("session_id"),
+                result.get("status"),
+                result.get("operation_count"),
+            )
         except Exception as error:  # noqa: BLE001 - a failed upload is not a failed call
-            logger.warning("vaani: finish/upload failed — %s", error)
+            # The package is already written, so this is recoverable — but only
+            # if the operator knows the spool now holds something that needs
+            # draining, and that on ephemeral storage it will not survive.
+            logger.warning(
+                "vaani: upload failed, package retained at %s — %s. "
+                "Run `python -m vaani_observer.drain` to retry.",
+                finalized.directory,
+                error,
+            )
 
     def finalize_open_spans(self, call: Any = None, outcome: Optional[str] = None) -> None:
         """Close anything still open so a dropped call cannot leak a span."""
@@ -360,7 +524,9 @@ class VaaniLiveKitRecorder:
                 socket, session=self.call, url=url, endpoint_id=endpoint_id
             )
         except Exception as error:  # noqa: BLE001 - transport health is optional
-            logger.debug("vaani: observe_websocket failed (%s)", error)
+            self._warn_once(
+                "observe-socket", "observe_websocket failed (%s)", error
+            )
             return None
         self._sockets.append(handle)
         return handle
@@ -393,7 +559,10 @@ class VaaniLiveKitRecorder:
     def tap_output_frame(self, frame: Any) -> None:
         """Record one agent PCM frame. Called from `Agent.tts_node`."""
         self._tap(frame, inbound=False)
-        state = self._current_turn
+        # Credit the reply being spoken, not whoever is talking now.
+        state = self._speaking_turn
+        if state is None or state.finished:
+            state = self._current_turn
         if state is None or self.call is None:
             return
         count = _frame_bytes(frame) or 0
@@ -425,6 +594,20 @@ class VaaniLiveKitRecorder:
             total_byte_count=state.audio_bytes,
         )
 
+    def _rate_for(self, track: str) -> int:
+        """The rate actually observed on a track, falling back to the default.
+
+        A span written before any frame has been tapped can only report the
+        configured default; once a frame has been seen, the default is a guess
+        we no longer need. Deepgram at 16 kHz used to produce spans claiming
+        24 kHz purely because that is the constructor default.
+        """
+        observed = self._observed_rates.get(track)
+        if observed:
+            return observed
+        fmt = self._input_format if track == "caller" else self._output_format
+        return int(fmt["sample_rate_hz"])
+
     def _tap(self, frame: Any, inbound: bool) -> None:
         call = self.call
         if call is None:
@@ -442,13 +625,29 @@ class VaaniLiveKitRecorder:
             fmt["sample_rate_hz"] = rate
         if isinstance(channels, int) and channels > 0:
             fmt["channels"] = channels
+        track = "caller" if inbound else "agent"
+        self._observed_rates.setdefault(track, int(fmt["sample_rate_hz"]))
         try:
             if inbound:
                 call.record_inbound_audio(data, fmt)
             else:
                 call.record_outbound_audio(data, fmt)
         except Exception as error:  # noqa: BLE001 - audio loss beats audio stall
-            logger.debug("vaani: audio frame dropped (%s)", error)
+            # The frame is gone either way, but the manifest must not go on
+            # claiming the recording is complete. A package that is quietly
+            # missing audio while `audio_complete` stays true is worse than one
+            # that admits the gap, because every number derived from it is
+            # trusted.
+            try:
+                call.degrade_audio()
+            except Exception:  # noqa: BLE001 - accounting must not raise
+                pass
+            self._warn_once(
+                f"audio-drop:{track}",
+                "%s audio frame dropped and the recording is now incomplete (%s)",
+                track,
+                error,
+            )
 
     # ---------------------------------------------------------------- events
 
@@ -503,7 +702,7 @@ class VaaniLiveKitRecorder:
             transport="websocket" if pending.metrics.get("streamed") else "http",
             started_at_ms=started_at_ms,
             request={
-                "sample_rate_hz": self._input_format["sample_rate_hz"],
+                "sample_rate_hz": self._rate_for("caller"),
                 "language": pending.language,
                 "model": pending.metrics.get("model"),
                 "streamed": pending.metrics.get("streamed"),
@@ -543,6 +742,7 @@ class VaaniLiveKitRecorder:
             return
         if speech_id in self._turns:
             self._current_turn = self._turns[speech_id]
+            self._speaking_turn = self._turns[speech_id]
             return
         state = self._pending_turn
         if state is None:
@@ -552,6 +752,7 @@ class VaaniLiveKitRecorder:
         self._pending_turn = None
         self._turns[speech_id] = state
         self._current_turn = state
+        self._speaking_turn = state
 
     def _on_usage(self, event: Any) -> None:
         """Cumulative session usage, kept on the manifest rather than a span.
@@ -566,7 +767,36 @@ class VaaniLiveKitRecorder:
         if payload is None:
             logger.debug("vaani: session usage not serialisable (%r)", type(usage))
             return
+        self._relabel_usage(payload)
         self.call.metadata["usage"] = payload
+
+    def _relabel_usage(self, payload: Any) -> None:
+        """Apply the resolved model name to the session usage rollup.
+
+        LiveKit reports the plugin's `model` *option* here, which for
+        `openai.LLM.with_azure(azure_deployment=...)` is left at its default of
+        `"gpt-4o"`. The per-turn spans already correct this, but the rollup is
+        what anyone aggregating cost or usage by model reads -- so leaving it
+        meant the manifest confidently attributed a whole session's tokens to a
+        model that was never called. The reported value is kept alongside
+        rather than discarded, because it is evidence of what the SDK was told.
+        """
+        if not isinstance(payload, dict):
+            return
+        entries = payload.get("model_usage")
+        if not isinstance(entries, list):
+            return
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            kind = str(entry.get("type") or "").replace("_usage", "")
+            resolved = self._model_overrides.get(kind) or self._sniffed_models.get(kind)
+            reported = entry.get("model")
+            if not resolved or resolved == reported:
+                continue
+            entry["model"] = resolved
+            if reported:
+                entry["reported_model"] = reported
 
     def _on_metrics(self, event: Any) -> None:
         metrics = getattr(event, "metrics", None)
@@ -590,10 +820,16 @@ class VaaniLiveKitRecorder:
             type="llm",
             endpoint_id=LLM_ENDPOINT_ID,
             provider=_provider(metrics),
-            model=_model(metrics),
+            model=self._model_for("llm", metrics),
             transport="http",
             started_at_ms=started_at,
-            request={"request_id": getattr(metrics, "request_id", None)},
+            request=_present(
+                request_id=getattr(metrics, "request_id", None),
+                # Keep what the plugin claimed when we overrode it, so the
+                # correction is auditable rather than a silent substitution.
+                reported_model=_reported_model(_model(metrics),
+                                               self._model_for("llm", metrics)),
+            ),
         )
         ttft = _ms(getattr(metrics, "ttft", None))
         if ttft is not None and ttft >= 0:
@@ -624,10 +860,10 @@ class VaaniLiveKitRecorder:
                 type="tts",
                 endpoint_id=TTS_ENDPOINT_ID,
                 provider=_provider(metrics),
-                model=_model(metrics),
+                model=self._model_for("tts", metrics),
                 transport="websocket" if getattr(metrics, "streamed", False) else "http",
                 started_at_ms=started_at,
-                request={"sample_rate_hz": self._output_format["sample_rate_hz"]},
+                request={"sample_rate_hz": self._rate_for("agent")},
             )
             state.tts = operation
         operation.event("speak", _present(char_count=getattr(metrics, "characters_count", None)))
@@ -652,7 +888,7 @@ class VaaniLiveKitRecorder:
         """STT metrics arrive without a speech id, so they decorate the pending span."""
         self._stt_identity = _present(
             provider=_provider(metrics),
-            model=_model(metrics),
+            model=self._model_for("stt", metrics),
             streamed=getattr(metrics, "streamed", None),
         )
         self._pending_stt.metrics = {
@@ -682,7 +918,10 @@ class VaaniLiveKitRecorder:
         """
         item = getattr(event, "item", None)
         role = getattr(item, "role", None)
-        state = self._current_turn
+        if role == "assistant":
+            state, resolved_exactly = self._reply_turn()
+        else:
+            state, resolved_exactly = self._current_turn, True
         if state is None:
             return
         metrics = getattr(item, "metrics", None) or {}
@@ -721,7 +960,90 @@ class VaaniLiveKitRecorder:
                 state.tts_response["text"] = text
             else:
                 state.tts_response["char_count"] = len(text)
+        # Independent of the TTS span: an agent can emit tts_metrics while its
+        # LLM emits none, and that turn still deserves an LLM span.
+        self._derive_llm(state, metrics, resolved_exactly)
         self._finish_turn(state)
+
+    def _reply_turn(self) -> "tuple[Optional[_TurnState], bool]":
+        """The turn an assistant conversation item belongs to, and how sure we are.
+
+        `conversation_item_added(assistant)` is emitted after the reply has
+        finished playing out -- seconds after the LLM metric that opened its
+        span. A caller who speaks in that window rotates `_current_turn` onto a
+        brand-new turn, so resolving by "current" folds the reply's report, and
+        any span derived from it, into a turn that never called an LLM.
+
+        `_speaking_turn` is set from `speech_created` and is an exact answer.
+        The event carries no speech id, so when there is no live speaking turn
+        the only remaining candidate is `_current_turn` -- returned with
+        `False`, because callers that would *create* data from it should not.
+        """
+        state = self._speaking_turn
+        if state is not None and not state.finished:
+            return state, True
+        return self._current_turn, False
+
+    def _derive_llm(self, state: Any, metrics: Mapping[str, Any],
+                    resolved_exactly: bool = True) -> None:
+        """Reconstruct an LLM span when `metrics_collected` never delivered one.
+
+        `_record_llm` runs from `metrics_collected` and nowhere else, so an
+        agent whose LLM plugin emits no metrics -- a custom `llm_node`, a
+        provider without a metrics implementation, a version where the event
+        moved -- previously produced a package with zero LLM spans and no
+        indication anything was missing. `conversation_item_added` carries the
+        session's own per-turn LLM timings, which is less than the plugin's
+        report but far more than nothing.
+
+        The span is explicitly marked derived: an approximate number a reader
+        knows is approximate is useful, while one they believe is measured is
+        worse than a gap.
+        """
+        if state.llm:
+            return
+        if not resolved_exactly and state.tts is None:
+            # We could not tell which turn this reply belongs to, and the
+            # candidate shows no sign of ever having replied. Deriving here
+            # would invent a span on a turn that never called an LLM -- and a
+            # confidently wrong number is worse than a gap.
+            return
+        ttft = _ms(metrics.get("llm_node_ttft"))
+        ttfs = _ms(metrics.get("llm_node_ttfs"))
+        if ttft is None and ttfs is None:
+            return
+        self._warn_once(
+            "llm-derived",
+            "vaani: no llm_metrics for this turn; deriving the LLM span from "
+            "conversation_item_added. Timings are approximate and token counts "
+            "are unavailable. Check that the LLM plugin emits metrics_collected.",
+        )
+        # `llm_node_ttfs` (first token handed to TTS) is the closest thing to
+        # an end that this event exposes; `ttft` is the floor when it is absent.
+        duration = max(0, ttfs if ttfs is not None else (ttft or 0))
+        started_at, ended_at = _back_dated(self.call.now(), duration)
+        operation = state.turn.start_operation(
+            type="llm",
+            endpoint_id=LLM_ENDPOINT_ID,
+            model=self._model_for("llm", None),
+            transport="http",
+            started_at_ms=started_at,
+            request=_present(derived_from="conversation_item_added"),
+        )
+        if ttft is not None and ttft >= 0:
+            operation.event("first_token", occurred_at_ms=started_at + ttft)
+        operation.end(
+            status="ok",
+            response=_present(
+                ttft_ms=ttft,
+                tokens_per_second=metrics.get("llm_node_tps"),
+                # Absent, not zero. Reporting zero tokens would corrupt every
+                # cost and throughput aggregate built on top of this package.
+                estimated=True,
+            ),
+            ended_at_ms=ended_at,
+        )
+        state.llm.append(operation)
 
     def _on_tools_executed(self, event: Any) -> None:
         state = self._current_turn
@@ -859,10 +1181,25 @@ class VaaniLiveKitRecorder:
     def _end_tts(self, state: _TurnState, status: str) -> None:
         if state.tts is None or state.tts.ended:
             return
-        rate = self._output_format["sample_rate_hz"] or 1
+        rate = self._rate_for("agent") or 1
         response = dict(state.tts_response)
         response.setdefault("audio_bytes", state.audio_bytes)
-        response.setdefault("audio_ms", round((state.audio_bytes / 2 / rate) * 1000))
+        # `audio_ms` and the taped bytes measure two different things, and
+        # conflating them is how a reader ends up trusting a number that is not
+        # what they think it is:
+        #
+        #   audio_ms  -- what the TTS provider says it synthesized.
+        #   played_ms -- what actually flowed through `tts_node` to the caller.
+        #
+        # On an interrupted reply the second is legitimately smaller, and that
+        # gap is the useful part: it is how much of the answer the caller never
+        # heard. Reporting only one of them, or silently overwriting one with
+        # the other, throws that away.
+        played_ms = round((state.audio_bytes / 2 / rate) * 1000)
+        if state.audio_bytes:
+            response.setdefault("played_ms", played_ms)
+        # Only stand in for the provider when it reported nothing at all.
+        response.setdefault("audio_ms", played_ms)
         if response.pop("cancelled", False) and status == "ok":
             status = "cancelled"
         state.tts.end(status=status, response=response, ended_at_ms=state.tts_ended_at)
@@ -895,6 +1232,7 @@ class VaaniAudioTapMixin:
 
     async def stt_node(self, audio, model_settings):  # noqa: ANN001, D102
         recorder = self.vaani
+        _warn_untapped(recorder, "stt_node")
 
         async def tapped():
             async for frame in audio:
@@ -921,11 +1259,33 @@ class VaaniAudioTapMixin:
 
     async def tts_node(self, text, model_settings):  # noqa: ANN001, D102
         recorder = self.vaani
+        _warn_untapped(recorder, "tts_node")
         source = super().tts_node(text, model_settings)
         async for frame in _scoped(recorder, source):
             if recorder is not None:
                 recorder.tap_output_frame(frame)
             yield frame
+
+
+def _warn_untapped(recorder: Optional[VaaniLiveKitRecorder], node: str) -> None:
+    """Say so the first time audio flows past an unwired tap.
+
+    The mixin is inert without `agent.vaani`, and being inert looks exactly
+    like working: the call records, the spans are there, the manifest is
+    valid -- and `call.audio` is empty. Warning at wire-up time cannot catch
+    this, because the mixin can be installed on an agent that is never given
+    a recorder. Warning here, where the frames actually go nowhere, can.
+    """
+    if recorder is not None:
+        return
+    warn_once(
+        "untapped-audio",
+        "vaani: %s is running through VaaniAudioTapMixin but agent.vaani is "
+        "not set, so NO audio is being captured. Call "
+        "observe_agent_session(session, recorder, agent=agent) or assign "
+        "agent.vaani = recorder before the session starts.",
+        node,
+    )
 
 
 async def _scoped(recorder: Optional[VaaniLiveKitRecorder], source: Any):
@@ -1022,24 +1382,84 @@ async def _aiter(source: Any):
 def observe_agent_session(
     session: Any,
     recorder: Optional[VaaniLiveKitRecorder] = None,
+    *,
+    agent: Any = None,
+    job_ctx: Any = None,
+    upload_timeout: Optional[float] = None,
     **options: Any,
 ) -> VaaniLiveKitRecorder:
-    """Attach a recorder to an `AgentSession`, building one from env if needed."""
+    """Attach a recorder to an `AgentSession` and wire its whole lifecycle.
+
+    Pass `agent` and `job_ctx` and the integration is complete — this is the
+    supported way to use it, because the two things a caller has to remember
+    are exactly the two that fail silently when forgotten:
+
+    * `agent.vaani = recorder`, without which no audio is ever captured.
+    * finalizing at *job shutdown*. `AgentSession.start()` returns when the
+      session starts, not when the call ends, so finalizing after it truncates
+      the recording mid-call.
+    """
     recorder = recorder or VaaniLiveKitRecorder.from_env(**options)
-    return recorder.attach(session)
+    recorder.attach(session)
+    if agent is not None:
+        agent.vaani = recorder
+    elif recorder.enabled:
+        # Audio is the single most expensive thing to lose and the easiest to
+        # forget, because nothing else about the recording looks wrong.
+        recorder._warn_once(
+            "no-agent",
+            "recorder is enabled but no agent was bound — pass agent=... to "
+            "observe_agent_session() or set agent.vaani, or no audio is captured",
+        )
+    if job_ctx is not None and recorder.enabled:
+        add = getattr(job_ctx, "add_shutdown_callback", None)
+        if add is None:
+            recorder._warn_once(
+                "no-shutdown-hook",
+                "job context has no add_shutdown_callback; call finish() yourself",
+            )
+        else:
+            # LiveKit inspects the callback's arity and passes the shutdown
+            # *reason* as the first positional argument when it accepts one.
+            # `recorder.finish` accepts one — so registering it directly would
+            # feed a raw LiveKit reason string in as the package `outcome`,
+            # which is a closed vocabulary. Keep the reason as metadata and let
+            # the close event decide the outcome.
+            async def _finish_at_shutdown(reason: str = "") -> None:
+                if reason and recorder.call is not None:
+                    recorder.call.metadata.setdefault("shutdown_reason", str(reason))
+                await recorder.finish(timeout=upload_timeout)
+
+            add(_finish_at_shutdown)
+    return recorder
 
 
 # --------------------------------------------------------------- small helpers
 
 
-def _guard(handler: Any) -> Any:
-    """Event handlers run on LiveKit's loop; a raised error would kill the call."""
+def _guard(recorder: "VaaniLiveKitRecorder", name: str, handler: Any) -> Any:
+    """Wrap an event handler so it can neither kill the call nor outlive it.
+
+    Two separate jobs:
+
+    * Handlers run on LiveKit's loop, so a raised error would take the call
+      down. Recording is best effort and must never do that.
+    * Handlers outlive the recording. `finish()` releases the call while the
+      session is still emitting — a job shutdown hook races the session's own
+      teardown, and `off()` is not atomic with respect to events LiveKit has
+      already dispatched. A handler that fires after `finish()` is therefore a
+      clean no-op rather than an `AttributeError` on a `None` call.
+    """
 
     def wrapped(event: Any) -> None:
+        if recorder.call is None:
+            return
         try:
             handler(event)
         except Exception as error:  # noqa: BLE001 - recording is best effort
-            logger.debug("vaani: handler %s failed (%s)", getattr(handler, "__name__", "?"), error)
+            recorder._warn_once(
+                f"handler:{name}", "handler %s failed (%s)", name, error
+            )
 
     return wrapped
 
@@ -1109,8 +1529,60 @@ def _error_targets(event: Any, error: Any) -> tuple:
             if stage in lowered:
                 return (stage,)
     return _ALL_ERROR_TARGETS
-    metadata = getattr(metrics, "metadata", None)
-    return getattr(metadata, "model_name", None)
+
+
+def _sniff_model(component: Any) -> Optional[str]:
+    """The model a provider is really using, when its label disagrees.
+
+    `openai.LLM.with_azure(azure_deployment="gpt-5-mini")` leaves the plugin's
+    `model` option at its `"gpt-4o"` default and hands the deployment to the
+    Azure client instead, so the metric reports `gpt-4o`. The deployment name
+    is read back off the client because it is the only place the truth exists.
+
+    Deliberately private-attribute access, and deliberately best effort: a
+    wrong-but-confident model label corrupts every per-model cost and latency
+    number downstream, so it is worth reaching for. If the plugin changes shape
+    this returns `None` and the reported label is used unchanged.
+    """
+    client = getattr(component, "_client", None)
+    deployment = getattr(client, "_azure_deployment", None)
+    if isinstance(deployment, str) and deployment.strip():
+        return deployment.strip()
+    return None
+
+
+def _reported_model(reported: Optional[str], resolved: Optional[str]) -> Optional[str]:
+    """Keep the provider's own label only when we replaced it."""
+    if reported and resolved and reported != resolved:
+        return reported
+    return None
+
+
+def _mark_delivered(finalized: Any, response: Any, observer: Any = None) -> None:
+    """Record that this package has already been shipped, and to where.
+
+    `drain` treats a receipt as "nothing to do here". Without one, a drain
+    sidecar -- which the docs recommend running alongside the worker -- cannot
+    tell a package that was just uploaded in-process from one that was never
+    uploaded at all, and re-ships every recording it sees.
+
+    The endpoint matters because this is where receipts actually come from in
+    production: almost every package is shipped in-process by `finish()`, and
+    the drain only sees the leftovers. A receipt with no destination recorded
+    would let a spool that moved backends look fully delivered to the new one.
+
+    The observer is read here rather than at the call site so that a custom or
+    stubbed observer without `options` cannot make a *successful* upload look
+    like a failed one -- bookkeeping must never be able to fail the call.
+    """
+    try:
+        from ..drain import _acknowledge
+
+        options = getattr(observer, "options", None)
+        endpoint = options.get("endpoint") if isinstance(options, dict) else None
+        _acknowledge(finalized, response, purge=False, endpoint=endpoint)
+    except Exception as error:  # noqa: BLE001 - bookkeeping, never a call failure
+        logger.debug("vaani: could not write the upload receipt — %s", error)
 
 
 def _frame_data(frame: Any) -> Optional[bytes]:
@@ -1143,3 +1615,31 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, "") or default)
     except ValueError:
         return default
+
+
+def _env_endpoints() -> List[Dict[str, Any]]:
+    """Connection-capture rules from `VAANI_ENDPOINTS`, a JSON array.
+
+    Each entry is `{"id", "type", "url"}` with an optional `"match"`, e.g.::
+
+        VAANI_ENDPOINTS='[{"id":"deepgram","type":"stt",
+                           "url":"wss://api.deepgram.com","match":"origin"}]'
+
+    A malformed value disables connection capture rather than the whole
+    recorder, and says so: losing transport spans is recoverable, losing the
+    call is not.
+    """
+    raw = os.environ.get("VAANI_ENDPOINTS", "").strip()
+    if not raw:
+        return []
+    import json
+
+    try:
+        parsed = json.loads(raw)
+    except ValueError as error:
+        logger.error("vaani: VAANI_ENDPOINTS is not valid JSON, ignoring it — %s", error)
+        return []
+    if not isinstance(parsed, list):
+        logger.error("vaani: VAANI_ENDPOINTS must be a JSON array, ignoring it")
+        return []
+    return parsed

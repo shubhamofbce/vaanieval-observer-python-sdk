@@ -26,6 +26,7 @@ import threading
 from typing import Any, List, Optional, Tuple
 
 from ._context import current_context
+from ._diagnostics import warn_once
 from ._payload import BYTES_TYPES, safe_error
 
 __all__ = [
@@ -492,7 +493,8 @@ def _patch_aiohttp_ws() -> None:
                 if not session.register_socket(handle):
                     handle.detach()
         except Exception as error:  # noqa: BLE001 - capture must never break a connect
-            logger.debug("vaani: websocket auto-observation skipped (%s)", error)
+            warn_once("ws-auto-observe",
+                      "vaani: websocket auto-observation skipped (%s)", error)
         return socket
 
     wrapped._vaani_patched = True

@@ -15,6 +15,22 @@ TEMP_TRACK_FILES = {
 OUTPUT_FILE = "call.audio"
 
 
+def _fit(samples: "array[int]", frames: int) -> "array[int]":
+    """`samples` as exactly `frames` entries: truncated, or zero-padded.
+
+    Extended-slice assignment on an `array` requires an exact length match, so
+    a track that ran short (the caller stopped talking first) has to be padded
+    rather than checked per index.
+    """
+    if len(samples) == frames:
+        return samples
+    if len(samples) > frames:
+        return samples[:frames]
+    padded = array("h", samples)
+    padded.frombytes(b"\x00" * (2 * (frames - len(samples))))
+    return padded
+
+
 def compose_stereo(
     directory: str,
     tracks: Mapping[str, Mapping[str, Any]],
@@ -44,11 +60,18 @@ def compose_stereo(
     frames = max(minimum_frames, *(len(samples) for samples in rendered.values()))
     caller = rendered.get("caller", array("h"))
     agent = rendered.get("agent", array("h"))
-    stereo = array("h")
-    stereo.extend(0 for _ in range(frames * 2))
-    for index in range(frames):
-        stereo[index * 2] = agent[index] if index < len(agent) else 0
-        stereo[index * 2 + 1] = caller[index] if index < len(caller) else 0
+    # Interleaving one sample at a time is ~7s of pure Python on a maximum
+    # length call, spent inside a shutdown window that is ten seconds wide by
+    # default -- so the recording could be killed before the upload it is
+    # blocking had begun. Extended-slice assignment does the identical work in
+    # C, ~57x faster.
+    # `array("h").frombytes(b"\x00" * frames * 4)` allocates a full-size `bytes`
+    # temporary alongside the array: measured 273 MB peak versus 132 MB on a
+    # 23-minute call, inside a shutdown window. Repetition builds the same
+    # zeroed buffer in one allocation, and is faster besides.
+    stereo = array("h", [0]) * (frames * 2)
+    stereo[0::2] = _fit(agent, frames)
+    stereo[1::2] = _fit(caller, frames)
     if sys.byteorder != "little":
         stereo.byteswap()
     with open(os.path.join(directory, OUTPUT_FILE), "wb") as handle:

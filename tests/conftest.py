@@ -67,8 +67,14 @@ class RecordingTransport:
         self.calls: List[Dict[str, Any]] = []
         self._handler = handler
 
-    def __call__(self, method: str, url: str, headers, body) -> HttpResponse:
-        call = {"method": method, "url": url, "headers": dict(headers), "body": body}
+    def __call__(self, method: str, url: str, headers, body, timeout=None) -> HttpResponse:
+        call = {
+            "method": method,
+            "url": url,
+            "headers": dict(headers),
+            "body": body,
+            "timeout": timeout,
+        }
         self.calls.append(call)
         return self._handler(call, len(self.calls))
 

@@ -31,7 +31,11 @@ def test_applies_documented_defaults():
         "payload_max_bytes": 16 * 1024,
     }
     assert vaani.options["endpoints"] == []
-    assert vaani.options["upload"] == {"retries": 3}
+    assert vaani.options["upload"] == {
+        "retries": 3,
+        "timeout_s": 30.0,
+        "compress": True,
+    }
     assert vaani.options["strict"] is False
     assert vaani.endpoint_rules == []
 
@@ -53,8 +57,16 @@ def test_websocket_instrumentation_stays_enabled_when_only_http_is_disabled():
 
 
 def test_merges_partial_upload_options_with_the_default_retry_count():
-    assert observer(upload={"retries": 0}).options["upload"] == {"retries": 0}
-    assert observer(upload={"timeout_ms": 10}).options["upload"] == {"retries": 3, "timeout_ms": 10}
+    assert observer(upload={"retries": 0}).options["upload"] == {
+        "retries": 0,
+        "timeout_s": 30.0,
+        "compress": True,
+    }
+    assert observer(upload={"timeout_s": 10}).options["upload"] == {
+        "retries": 3,
+        "timeout_s": 10,
+        "compress": True,
+    }
 
 
 def test_treats_a_nullish_endpoints_option_as_an_empty_rule_set():

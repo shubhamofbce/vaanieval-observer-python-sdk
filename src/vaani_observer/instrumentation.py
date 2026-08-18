@@ -27,6 +27,7 @@ import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 from ._context import current_context
+from ._diagnostics import warn_once
 from ._payload import bounded_body, bounded_text, safe_error
 
 logger = logging.getLogger("vaani_observer")
@@ -197,7 +198,8 @@ def _begin(url: str, transport: str):
             # deliberately raise through to the caller instead: that is a
             # configuration bug the developer has to fix, and swallowing it
             # would silently mis-attribute every call to that endpoint.
-            logger.debug("vaani: url classification skipped for %r (%s)", url, error)
+            warn_once("classify-url",
+                      "vaani: url classification skipped for %r (%s)", url, error)
             return None, None
     if not rule:
         return None, None
@@ -217,7 +219,7 @@ def _safe(thunk: Any, default: Any = None) -> Any:
     try:
         return thunk()
     except BaseException as error:  # noqa: BLE001 - degradation, not a crash
-        logger.debug("vaani: http capture step failed (%s)", error)
+        warn_once("http-capture", "vaani: http capture step failed (%s)", error)
         return default
 
 
@@ -308,5 +310,5 @@ async def _safe_await(awaitable: Any) -> Any:
     try:
         return await awaitable
     except BaseException as error:  # noqa: BLE001 - degradation, not a crash
-        logger.debug("vaani: http body capture failed (%s)", error)
+        warn_once("http-body", "vaani: http body capture failed (%s)", error)
         return None

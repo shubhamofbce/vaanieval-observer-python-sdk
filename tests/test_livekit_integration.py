@@ -31,6 +31,11 @@ class FakeAgentSession:
     def on(self, name: str, handler) -> None:  # noqa: ANN001
         self.handlers.setdefault(name, []).append(handler)
 
+    def off(self, name: str, handler) -> None:  # noqa: ANN001
+        registered = self.handlers.get(name, [])
+        if handler in registered:
+            registered.remove(handler)
+
     def emit(self, name: str, event: Any) -> None:
         for handler in self.handlers.get(name, []):
             handler(event)
@@ -185,9 +190,9 @@ async def _finalized(rec):
 def _capture_finalized(monkeypatch):
     original = VaaniLiveKitRecorder.finish
 
-    async def finish(self, outcome=None):
+    async def finish(self, outcome=None, timeout=None):
         call = self.call
-        await original(self, outcome)
+        await original(self, outcome, timeout)
         if call is not None:
             self._finalized = await call.finished
 

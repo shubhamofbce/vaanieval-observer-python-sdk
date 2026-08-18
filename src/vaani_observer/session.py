@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Mapping,
 
 from ._context import ObserverContext, reset_context, set_context
 from ._audio import TEMP_TRACK_FILES, compose_stereo
+from ._diagnostics import warn_once
 from ._payload import (
     BYTES_TYPES,
     bounded_payload,
@@ -508,13 +509,31 @@ class Session:
         """A bounded-queue drop. Same accounting as a failed write."""
         self._degrade(filename)
 
-    def _degrade(self, filename: str) -> None:
-        if filename in TEMP_TRACK_FILES.values():
+    def degrade_audio(self) -> None:
+        """Record that a caller-supplied audio chunk was not captured.
+
+        Integrations tap frames off the media path and must swallow their own
+        failures — a stalled recorder is worse than a lossy one. But the
+        manifest then has to say so, or the package reports `audio_complete`
+        while silently missing audio, and every duration and alignment derived
+        from it is quietly wrong.
+
+        Reachable from two threads -- an integration's event loop and the
+        writer -- so the counter takes the lock every other mutation of shared
+        state in this class takes. An unlocked `+= 1` under-reports, and the
+        whole point of the counter is to be believed.
+        """
+        with self._lock:
             self.capture_status["audio_complete"] = False
             self.capture_status["dropped_audio_chunk_count"] += 1
+
+    def _degrade(self, filename: str) -> None:
+        if filename in TEMP_TRACK_FILES.values():
+            self.degrade_audio()
             return
-        self.capture_status["events_complete"] = False
-        self.capture_status["dropped_event_count"] += 1
+        with self._lock:
+            self.capture_status["events_complete"] = False
+            self.capture_status["dropped_event_count"] += 1
 
     # ---------------------------------------------------------- finalization
 
@@ -555,7 +574,8 @@ class Session:
                 # teardown, not cancelled mid-flight.
                 handle.detach(status="ok" if outcome == "completed" else "cancelled")
             except Exception as error:  # noqa: BLE001 - finalization is best effort
-                logger.debug("vaani: socket finalization failed (%s)", error)
+                warn_once("socket-finalize",
+                          "vaani: socket finalization failed (%s)", error)
         with self._lock:
             if self._ended:
                 return await self.finished

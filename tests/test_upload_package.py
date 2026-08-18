@@ -23,6 +23,9 @@ def uploader(**options):
     options.setdefault("endpoint", "https://ingest.example.com")
     options.setdefault("api_key", "test-key")
     options.setdefault("instrumentations", {"http": False})
+    # Retries are exercised deliberately in the retry tests below; everywhere
+    # else they would only add sleeps and obscure the call sequence under test.
+    options.setdefault("upload", {"retries": 0})
     return VaaniObserver(**options)
 
 

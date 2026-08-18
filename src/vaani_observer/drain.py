@@ -102,25 +102,45 @@ def _receipt_covers(directory: str, endpoint: Optional[str]) -> bool:
 
     Receipts written before this field existed carry no endpoint. Those are
     honoured as-is: a pre-existing spool must not suddenly re-upload wholesale.
+    That permissive fallback is safe for *skipping* and unsafe for *deleting*,
+    so the purge asks `_receipt_proves` instead, which demands real evidence.
     """
+    return _read_receipt(directory, endpoint)[0]
+
+
+def _receipt_proves(directory: str, endpoint: Optional[str]) -> bool:
+    """Is there positive evidence *this* backend holds the package?
+
+    Skipping an upload and deleting a recording need opposite defaults. Getting
+    a skip wrong costs a redundant idempotent re-upload; getting a delete wrong
+    destroys the call from the only machine that had it. So an endpoint-less
+    receipt -- one written before the field existed, or by a path that could not
+    determine the destination -- is skipped forever but never purged. It is
+    stranded, which is recoverable; deleting it is not.
+    """
+    covered, receipt = _read_receipt(directory, endpoint)
+    return covered and isinstance(receipt, dict) and bool(receipt.get("endpoint"))
+
+
+def _read_receipt(directory: str, endpoint: Optional[str]) -> "tuple[bool, Any]":
     path = os.path.join(directory, RECEIPT_NAME)
     if not os.path.exists(path):
-        return False
-    if not endpoint:
-        return True
+        return False, None
     try:
         with open(path, "r", encoding="utf-8") as handle:
             receipt = json.load(handle)
     except (OSError, ValueError):
         # An unreadable receipt is not evidence of delivery. Re-uploading is
         # idempotent; assuming delivery is not recoverable.
-        return False
+        return False, None
     if not isinstance(receipt, dict):
-        return False
+        return False, None
+    if not endpoint:
+        return True, receipt
     recorded = receipt.get("endpoint")
     if not recorded:
-        return True
-    return str(recorded).rstrip("/") == str(endpoint).rstrip("/")
+        return True, receipt
+    return str(recorded).rstrip("/") == str(endpoint).rstrip("/"), receipt
 
 
 def _scan(spool_directory: str, endpoint: Optional[str] = None) -> "tuple[List[FinalizedSession], List[str]]":
@@ -160,7 +180,24 @@ def _scan(spool_directory: str, endpoint: Optional[str] = None) -> "tuple[List[F
                 manifest=manifest,
             )
         )
-    return packages, delivered
+    return _oldest_first(packages), delivered
+
+
+def _oldest_first(packages: List[FinalizedSession]) -> List[FinalizedSession]:
+    """Order a pass so the calls most at risk of being lost ship first.
+
+    Directory names are session ids, which are UUIDs by default, so sorting by
+    name is arbitrary. That matters on an ephemeral host -- the case the docs
+    warn about -- where the container may die partway through a backlog: FIFO
+    at least means the recordings that have already waited longest are the ones
+    that get out. Packages whose manifest carries no usable `started_at` sort
+    last rather than being dropped.
+    """
+    def key(package: FinalizedSession) -> "tuple[int, str]":
+        started = package.manifest.get("started_at")
+        return (1, "") if not isinstance(started, str) else (0, started)
+
+    return sorted(packages, key=key)
 
 
 def drain_spool(
@@ -191,7 +228,7 @@ def drain_spool(
     # fills the disk of any worker that records all day, which is every worker.
     # The docs promised this cleanup long before anything performed it.
     if purge and delivered_ttl_s is not None:
-        result.purged = _purge_delivered(directory, delivered, delivered_ttl_s)
+        result.purged = _purge_delivered(directory, delivered, delivered_ttl_s, endpoint)
         result.skipped = [name for name in delivered if name not in set(result.purged)]
     for package in packages:
         try:
@@ -226,10 +263,14 @@ def _acknowledge(
         return
     receipt = {
         "session_id": package.session_id,
-        "endpoint": endpoint,
         "uploaded_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "response": response if isinstance(response, (dict, list)) else None,
     }
+    # Omitted rather than written as null when it cannot be determined, so that
+    # "written before this field existed" stays distinguishable from "we could
+    # not tell" -- the purge treats an unprovenanced receipt as not-evidence.
+    if endpoint:
+        receipt["endpoint"] = str(endpoint)
     try:
         with open(os.path.join(package.directory, RECEIPT_NAME), "w", encoding="utf-8") as handle:
             json.dump(receipt, handle)
@@ -326,12 +367,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
 
-def _purge_delivered(spool_directory: str, delivered: List[str], ttl_s: float) -> List[str]:
+def _purge_delivered(
+    spool_directory: str, delivered: List[str], ttl_s: float, endpoint: Optional[str] = None
+) -> List[str]:
     """Remove acknowledged packages once they are older than `ttl_s`.
 
     Age is taken from the receipt, not the package, because the receipt is
     written when delivery was confirmed -- that is the point from which the
     local copy is redundant.
+
+    Deletion demands stricter evidence than skipping does: only a receipt that
+    names the backend currently being written to justifies removing a call.
     """
     if ttl_s < 0:
         return []
@@ -339,6 +385,8 @@ def _purge_delivered(spool_directory: str, delivered: List[str], ttl_s: float) -
     purged: List[str] = []
     for name in delivered:
         directory = os.path.join(spool_directory, name)
+        if not _receipt_proves(directory, endpoint):
+            continue
         age = _delivered_age(os.path.join(directory, RECEIPT_NAME), now)
         if age is None or age < ttl_s:
             continue

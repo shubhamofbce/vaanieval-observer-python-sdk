@@ -1579,7 +1579,11 @@ def _mark_delivered(finalized: Any, response: Any, observer: Any = None) -> None
         from ..drain import _acknowledge
 
         options = getattr(observer, "options", None)
-        endpoint = options.get("endpoint") if isinstance(options, dict) else None
+        endpoint = None
+        if isinstance(options, Mapping):
+            endpoint = options.get("endpoint")
+        else:
+            endpoint = getattr(options, "endpoint", None)
         _acknowledge(finalized, response, purge=False, endpoint=endpoint)
     except Exception as error:  # noqa: BLE001 - bookkeeping, never a call failure
         logger.debug("vaani: could not write the upload receipt — %s", error)

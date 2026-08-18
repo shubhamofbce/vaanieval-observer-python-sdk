@@ -4,9 +4,9 @@ Kept apart from `test_livekit_integration.py` because that file describes what
 the recorder *does*; this one pins the ways it used to lose a recording without
 saying so.
 
-Nineteen of these fail against the pre-fix source (`git show
-HEAD:src/vaani_observer/integrations/livekit.py`) and are proofs of a specific
-past bug. The remaining six guard behaviour that did not exist before the fix
+Twenty-one of these fail against the pre-fix source (`git show
+HEAD~1:src/vaani_observer/integrations/livekit.py`) and are proofs of a specific
+past bug. The remaining seven guard behaviour that did not exist before the fix
 and therefore cannot fail against it:
 
     test_a_second_finish_is_a_no_op
@@ -15,6 +15,7 @@ and therefore cannot fail against it:
     test_an_explicit_zero_timeout_still_means_no_budget
     test_a_plugin_whose_model_property_raises_does_not_kill_the_recording
     test_played_ms_is_absent_rather_than_zero_when_no_audio_was_taped
+    test_receipt_bookkeeping_can_never_fail_a_successful_upload
 
 That distinction is recorded because an earlier version of this file claimed
 all of them failed pre-fix. They did -- but on a `TypeError` from the autouse

@@ -3,6 +3,12 @@
 Recording and uploading are separate for a reason -- a LiveKit worker's default
 `shutdown_process_timeout` is ten seconds and a five-minute call is ~28 MB of
 raw PCM -- so a package left behind has to be recoverable out of band.
+
+`drain.py` is a new module, so none of these tests can be run against a pre-fix
+version of it: there is no pre-fix version. Their baseline is instead the
+behaviour they each describe -- the purge and receipt-scoping tests were
+verified by reverting the specific guard they exercise and confirming they fail
+for the stated reason, which is the only honest check available here.
 """
 
 from __future__ import annotations
@@ -51,8 +57,11 @@ def recording(spool):
     return record
 
 
+ENDPOINT = "https://ingest.example.com"
+
+
 def uploader(spool, **options):
-    options.setdefault("endpoint", "https://ingest.example.com")
+    options.setdefault("endpoint", ENDPOINT)
     options.setdefault("api_key", "test-key")
     options.setdefault("instrumentations", {"http": False, "websocket": False})
     options.setdefault("spool_directory", spool)
@@ -166,7 +175,7 @@ def test_the_summary_distinguishes_an_empty_spool_from_a_delivered_one(tmp_path)
         directory = spool / name
         directory.mkdir(parents=True)
         (directory / "manifest.json").write_text(json.dumps({"session_id": name}))
-        (directory / RECEIPT_NAME).write_text(json.dumps({"session_id": name}))
+        (directory / RECEIPT_NAME).write_text(json.dumps({"session_id": name, "endpoint": ENDPOINT}))
 
     class Observer:
         options = {"spool_directory": str(spool)}
@@ -201,7 +210,7 @@ async def test_a_package_delivered_in_process_is_eventually_removed(recording, s
     await recording(1)
     directory = os.path.join(spool, os.listdir(spool)[0])
     with open(os.path.join(directory, RECEIPT_NAME), "w", encoding="utf-8") as handle:
-        json.dump({"session_id": "call-0"}, handle)
+        json.dump({"session_id": "call-0", "endpoint": ENDPOINT}, handle)
     old = time.time() - 48 * 3600
     os.utime(os.path.join(directory, RECEIPT_NAME), (old, old))
 
@@ -217,7 +226,7 @@ async def test_a_freshly_delivered_package_is_kept_for_the_ttl(recording, spool)
     await recording(1)
     directory = os.path.join(spool, os.listdir(spool)[0])
     with open(os.path.join(directory, RECEIPT_NAME), "w", encoding="utf-8") as handle:
-        json.dump({"session_id": "call-0"}, handle)
+        json.dump({"session_id": "call-0", "endpoint": ENDPOINT}, handle)
 
     result = drain_spool(uploader(spool), spool_directory=spool, delivered_ttl_s=24 * 3600)
 
@@ -232,7 +241,7 @@ async def test_delivered_packages_can_be_kept_indefinitely(recording, spool):
     await recording(1)
     directory = os.path.join(spool, os.listdir(spool)[0])
     with open(os.path.join(directory, RECEIPT_NAME), "w", encoding="utf-8") as handle:
-        json.dump({"session_id": "call-0"}, handle)
+        json.dump({"session_id": "call-0", "endpoint": ENDPOINT}, handle)
     old = time.time() - 90 * 24 * 3600
     os.utime(os.path.join(directory, RECEIPT_NAME), (old, old))
 
@@ -311,7 +320,7 @@ async def test_a_copied_spool_does_not_lose_its_delivery_clock(recording, spool)
     name = os.listdir(spool)[0]
     long_ago = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 90 * 3600))
     with open(os.path.join(spool, name, RECEIPT_NAME), "w", encoding="utf-8") as handle:
-        json.dump({"session_id": "call-0", "uploaded_at": long_ago}, handle)
+        json.dump({"session_id": "call-0", "endpoint": ENDPOINT, "uploaded_at": long_ago}, handle)
 
     copied = spool + "-copy"
     shutil.copytree(spool, copied)
@@ -330,7 +339,7 @@ async def test_a_receipt_without_a_timestamp_falls_back_to_mtime(recording, spoo
     await recording(1)
     name = os.listdir(spool)[0]
     with open(os.path.join(spool, name, RECEIPT_NAME), "w", encoding="utf-8") as handle:
-        json.dump({"session_id": "call-0"}, handle)
+        json.dump({"session_id": "call-0", "endpoint": ENDPOINT}, handle)
     old = time.time() - 90 * 3600
     os.utime(os.path.join(spool, name, RECEIPT_NAME), (old, old))
 
@@ -347,7 +356,7 @@ async def test_a_receipt_stamped_in_the_future_is_not_treated_as_ancient(recordi
     name = os.listdir(spool)[0]
     future = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 86400))
     with open(os.path.join(spool, name, RECEIPT_NAME), "w", encoding="utf-8") as handle:
-        json.dump({"session_id": "call-0", "uploaded_at": future}, handle)
+        json.dump({"session_id": "call-0", "endpoint": ENDPOINT, "uploaded_at": future}, handle)
 
     result = drain_spool(uploader(spool), spool_directory=spool, delivered_ttl_s=3600)
 
@@ -450,3 +459,82 @@ async def test_the_purge_never_deletes_a_call_the_current_backend_lacks(recordin
     assert result.uploaded == ["call-0"], "prod must actually receive the call"
     posted = [c["url"] for c in transport.calls if c["method"] == "POST"]
     assert any("prod.example.com" in url for url in posted), posted
+
+
+async def test_the_purge_spares_a_receipt_that_names_no_backend(recording, spool):
+    """The one cell of the matrix that loses data: no endpoint, purge armed.
+
+    Skipping and deleting need opposite defaults. An endpoint-less receipt is
+    honoured for skipping, so a pre-existing spool does not re-upload
+    wholesale -- but it is not evidence that the backend now being written to
+    holds the call, so it must never justify deleting it.
+    """
+    await recording(1)
+    directory = os.path.join(spool, "call-0")
+    with open(os.path.join(directory, RECEIPT_NAME), "w", encoding="utf-8") as handle:
+        json.dump({"session_id": "call-0", "uploaded_at": "2020-01-01T00:00:00Z"}, handle)
+
+    observer = uploader(spool, endpoint="https://prod.example.com")
+    RecordingTransport(ok_handler).install(observer)
+    result = drain_spool(observer, spool_directory=spool, purge=True, delivered_ttl_s=0)
+
+    assert result.purged == [], "an unprovenanced receipt is not evidence of delivery"
+    assert result.skipped == ["call-0"], "but it still suppresses a re-upload"
+    assert os.path.exists(directory), "the only copy of this call must survive"
+
+
+async def test_a_receipt_recording_a_null_endpoint_is_not_evidence_either(recording, spool):
+    """`endpoint: null` must not read as "delivered to wherever you are now"."""
+    await recording(1)
+    directory = os.path.join(spool, "call-0")
+    with open(os.path.join(directory, RECEIPT_NAME), "w", encoding="utf-8") as handle:
+        json.dump({"session_id": "call-0", "endpoint": None,
+                   "uploaded_at": "2020-01-01T00:00:00Z"}, handle)
+
+    observer = uploader(spool, endpoint="https://prod.example.com")
+    RecordingTransport(ok_handler).install(observer)
+    result = drain_spool(observer, spool_directory=spool, purge=True, delivered_ttl_s=0)
+
+    assert result.purged == []
+    assert os.path.exists(directory)
+
+
+async def test_a_delivered_package_is_still_purged_once_its_backend_matches(recording, spool):
+    """The stricter purge must not disable retention for the normal case."""
+    await recording(1)
+    observer = uploader(spool, endpoint="https://ingest.example.com")
+    RecordingTransport(ok_handler).install(observer)
+    drain_spool(observer, spool_directory=spool, purge=False)
+
+    again = uploader(spool, endpoint="https://ingest.example.com")
+    RecordingTransport(ok_handler).install(again)
+    result = drain_spool(again, spool_directory=spool, purge=True, delivered_ttl_s=0)
+
+    assert result.purged == ["call-0"]
+    assert not os.path.exists(os.path.join(spool, "call-0"))
+
+
+def test_a_pass_ships_the_longest_waiting_call_first(tmp_path):
+    """Session ids are UUIDs, so sorting by directory name is arbitrary.
+
+    On an ephemeral host the container can die partway through a backlog, so
+    the order decides which recordings survive.
+    """
+    spool = tmp_path / "spool"
+    for name, started in [
+        ("zzz", "2026-01-01T00:00:00.000Z"),
+        ("aaa", "2026-03-01T00:00:00.000Z"),
+        ("mmm", "2026-02-01T00:00:00.000Z"),
+        ("nnn", None),
+    ]:
+        directory = spool / name
+        directory.mkdir(parents=True)
+        manifest = {"session_id": name}
+        if started:
+            manifest["started_at"] = started
+        (directory / "manifest.json").write_text(json.dumps(manifest))
+
+    order = [package.session_id for package in pending_packages(str(spool))]
+
+    assert order[:3] == ["zzz", "mmm", "aaa"], "oldest call first, not lowest name"
+    assert order[3] == "nnn", "an undated package sorts last, but is never dropped"

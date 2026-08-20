@@ -1522,6 +1522,16 @@ class VaaniLiveKitRecorder:
         if stream.owner is not None or owner is None:
             return stream.owner
         stream.owner = owner
+        # Resolved, so stop holding it for a `speech_created` that has either
+        # already arrived or is no longer needed. Without this a stream pinned
+        # by a later frame stays in the waiting map -- with its buffered text
+        # -- for the rest of the call. marker:r9-release
+        waiting = self._unpinned_streams.get(stream.speech_id or "")
+        if waiting is not None:
+            if stream in waiting:
+                waiting.remove(stream)
+            if not waiting:
+                self._unpinned_streams.pop(stream.speech_id or "", None)
         if not stream.closed:
             owner.open_streams += 1
         self._flush_stream_buffer(stream, owner)

@@ -1063,25 +1063,58 @@ class VaaniLiveKitRecorder:
                 logger.debug("vaani: cannot record coverage gap (%s)", error)
             if unattributed_ms <= _PLAYOUT_TOLERANCE_MS and not turns:
                 return
-        logger.warning(
-            "vaani: %dms of agent audio is not attributed to any tts operation "
-            "(%d turn(s) rendered audio with no span); this call is reported as "
-            "an incomplete capture rather than as healthy. Check that the TTS "
-            "plugin emits metrics_collected.",
-            unattributed_ms, len(turns),
-        )
-        try:
-            report(
-                "tts",
-                "agent audio was rendered that no tts operation accounts for",
-                turn_count=len(turns),
-                unattributed_agent_audio_ms=unattributed_ms,
-                # Naming the turns is the difference between "some audio is
-                # missing" and a lead an operator can actually pull on.
-                turn_ids=[s.id for s in turns],
+        # Two different failures reach here and they are not interchangeable.
+        # A reply whose *words* were taped but which never made a sound (the
+        # call ended while it was being spoken) is a missing rendering; a reply
+        # that made a sound with no span is a missing measurement. Reporting
+        # both as "agent audio was rendered that no tts operation accounts for"
+        # told an operator to go looking for audio that was never there, and a
+        # gap payload that says `unattributed_agent_audio_ms: 0` in the same
+        # breath is precisely the confidently-wrong reporting this status
+        # exists to avoid. marker:r9-silent-reply
+        # "Silent" means no audio at all, not "less audio than the tolerance":
+        # a reply that spoke briefly still lost a real measurement, and the
+        # tolerance exists for boundary jitter, not for deciding whether a
+        # sound happened.
+        silent = [s for s in turns if s.audio_bytes <= 0]
+        sounded = [s for s in turns if s.audio_bytes > 0]
+        if sounded or unattributed_ms > _PLAYOUT_TOLERANCE_MS:
+            logger.warning(
+                "vaani: %dms of agent audio is not attributed to any tts operation "
+                "(%d turn(s) rendered audio with no span); this call is reported as "
+                "an incomplete capture rather than as healthy. Check that the TTS "
+                "plugin emits metrics_collected.",
+                unattributed_ms, len(sounded),
             )
-        except Exception as error:  # noqa: BLE001 - teardown must not raise
-            logger.debug("vaani: cannot record coverage gap (%s)", error)
+            try:
+                report(
+                    "tts",
+                    "agent audio was rendered that no tts operation accounts for",
+                    turn_count=len(sounded),
+                    unattributed_agent_audio_ms=unattributed_ms,
+                    # Naming the turns is the difference between "some audio is
+                    # missing" and a lead an operator can actually pull on.
+                    turn_ids=[s.id for s in sounded],
+                )
+            except Exception as error:  # noqa: BLE001 - teardown must not raise
+                logger.debug("vaani: cannot record coverage gap (%s)", error)
+        if silent:
+            logger.warning(
+                "vaani: %d repl(ies) were composed but never rendered as audio, so "
+                "they have no tts operation and no spoken duration; this usually "
+                "means the call ended while the agent was still speaking.",
+                len(silent),
+            )
+            try:
+                report(
+                    "tts",
+                    "a reply's text was captured but it was never rendered as "
+                    "audio, so no tts operation reports it",
+                    turn_count=len(silent),
+                    turn_ids=[s.id for s in silent],
+                )
+            except Exception as error:  # noqa: BLE001 - teardown must not raise
+                logger.debug("vaani: cannot record coverage gap (%s)", error)
 
     def _derived_agent_audio_ms(self, rate: int, channels: int) -> int:
         return sum(

@@ -3257,3 +3257,37 @@ async def test_a_greeting_before_the_caller_speaks_still_opens_its_own_turn(reco
     assert len(states) == 2
     assert states[0].stt is None, "the greeting answers nothing"
     assert states[1].stt is not None, "the caller's first utterance keeps its own turn"
+
+
+async def test_a_reply_that_never_made_a_sound_is_not_reported_as_missing_audio(recorder):
+    """The call ends while the agent is still being spoken: its words were
+    taped, no audio was rendered, and no TTS metric arrived. That is a missing
+    *rendering*, and reporting it as unaccounted-for audio sent an operator
+    looking for something that never existed -- alongside a payload that said
+    `unattributed_agent_audio_ms: 0` in the same breath."""
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    await run_one_turn(rec, session, speech_id="speech-1")
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("metrics_collected", stt_metrics())
+    session.emit("user_input_transcribed", transcript("aur hotel", True))
+    session.emit("speech_created", speech_created(SimpleNamespace(id="speech-2")))
+    session.emit("metrics_collected", llm_metrics("speech-2"))
+    # `tts_node` began emitting the reply's words, then the room closed before
+    # a single frame was rendered and before LiveKit added the chat item.
+    stream = rec.open_output_stream()
+    stream.speech_id = "speech-2"
+    rec.tap_output_text("hotel bhi dekh lete hain", stream=stream)
+    rec.close_output_stream(stream)
+    await rec.finish()
+
+    capture = _manifest_of(rec)["capture_status"]
+    gaps = capture.get("coverage_gaps") or []
+    silent = [g for g in gaps if "never rendered as audio" in g["reason"]]
+    assert silent, f"the unrendered reply must be named for what it is: {gaps}"
+    assert silent[0]["turn_ids"] == ["turn-2"]
+    assert "unattributed_agent_audio_ms" not in silent[0], (
+        "a reply that made no sound has no unattributed audio to report")
+    assert not [g for g in gaps if "audio was rendered that no tts" in g["reason"]], (
+        "no audio was rendered, so that gap must not fire")

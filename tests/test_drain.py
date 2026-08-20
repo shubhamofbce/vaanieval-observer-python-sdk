@@ -20,7 +20,13 @@ import pytest
 
 from conftest import PCM, RecordingTransport, empty_response, json_response
 from vaani_observer import VaaniObserver
-from vaani_observer.drain import RECEIPT_NAME, drain_spool, pending_packages
+from vaani_observer.drain import (
+    RECEIPT_NAME,
+    EndpointChanged,
+    drain_spool,
+    pending_packages,
+)
+from vaani_observer.drain import main as drain_main
 
 UPLOAD_URLS = {
     "events.jsonl": "https://objects.example.com/events",
@@ -380,7 +386,13 @@ async def test_a_receipt_from_a_different_backend_does_not_count_as_delivered(re
     moved = uploader(spool, endpoint="https://prod.example.com")
     transport = RecordingTransport(ok_handler)
     transport.install(moved)
-    result = drain_spool(moved, spool_directory=spool, purge=False, delivered_ttl_s=0)
+    result = drain_spool(
+        moved,
+        spool_directory=spool,
+        purge=False,
+        delivered_ttl_s=0,
+        allow_endpoint_change=True,
+    )
 
     assert result.uploaded == ["call-0"], "the new backend never received this call"
     assert result.purged == [], "a package the new backend lacks must never be purged"
@@ -453,7 +465,13 @@ async def test_the_purge_never_deletes_a_call_the_current_backend_lacks(recordin
     moved = uploader(spool, endpoint="https://prod.example.com")
     transport = RecordingTransport(ok_handler)
     transport.install(moved)
-    result = drain_spool(moved, spool_directory=spool, purge=True, delivered_ttl_s=0)
+    result = drain_spool(
+        moved,
+        spool_directory=spool,
+        purge=True,
+        delivered_ttl_s=0,
+        allow_endpoint_change=True,
+    )
 
     assert result.purged == [], "nothing may be purged before prod holds it"
     assert result.uploaded == ["call-0"], "prod must actually receive the call"
@@ -538,3 +556,271 @@ def test_a_pass_ships_the_longest_waiting_call_first(tmp_path):
 
     assert order[:3] == ["zzz", "mmm", "aaa"], "oldest call first, not lowest name"
     assert order[3] == "nnn", "an undated package sorts last, but is never dropped"
+
+
+# --- Re-pointing the drain must not silently exfiltrate raw audio ------------
+#
+# A package holds the caller's voice and whatever they said. Delivery is what
+# authorises deleting the local copy, so a typo'd VAANI_ENDPOINT ships that to
+# an arbitrary host *and* destroys the only other copy, reporting success.
+
+
+async def test_refuses_to_drain_to_an_endpoint_the_spool_has_never_used(recording, spool):
+    await recording(2)
+    known = uploader(spool)
+    RecordingTransport(ok_handler).install(known)
+    drain_spool(known, spool_directory=spool, purge=False)
+
+    await recording(1)
+    typo = uploader(spool, endpoint="https://ingest.exmaple.com")
+    transport = RecordingTransport(ok_handler)
+    transport.install(typo)
+
+    with pytest.raises(EndpointChanged) as caught:
+        drain_spool(typo, spool_directory=spool)
+
+    assert transport.calls == [], "nothing may leave before the operator confirms"
+    message = str(caught.value)
+    assert ENDPOINT in message and "ingest.exmaple.com" in message
+    assert "--yes" in message, "the refusal has to name its own remedy"
+    assert os.path.isdir(os.path.join(spool, "call-0"))
+
+
+async def test_a_confirmed_endpoint_change_uploads_but_keeps_the_local_copies(
+    recording, spool
+):
+    """`--yes` authorises the disclosure, not the deletion.
+
+    The operator has had no chance to check that anything arrived at a host
+    this spool has never shipped to, so a 2xx from it is not yet evidence
+    worth destroying the only local copy on.
+    """
+    await recording(1)
+    known = uploader(spool)
+    RecordingTransport(ok_handler).install(known)
+    drain_spool(known, spool_directory=spool, purge=False)
+
+    await recording(2)
+    moved = uploader(spool, endpoint="https://ingest-2.example.com")
+    RecordingTransport(ok_handler).install(moved)
+
+    result = drain_spool(moved, spool_directory=spool, allow_endpoint_change=True)
+
+    assert sorted(result.uploaded) == ["call-0", "call-1"]
+    for name in result.uploaded:
+        assert os.path.isdir(os.path.join(spool, name)), "local evidence kept"
+
+
+async def test_the_second_pass_to_a_now_known_endpoint_is_unguarded(recording, spool):
+    """A migration must not need the flag forever, or it will be aliased away."""
+    await recording(1)
+    moved = uploader(spool, endpoint="https://ingest-2.example.com")
+    RecordingTransport(ok_handler).install(moved)
+    drain_spool(moved, spool_directory=spool, allow_endpoint_change=True)
+
+    await recording(2)
+    again = uploader(spool, endpoint="https://ingest-2.example.com")
+    RecordingTransport(ok_handler).install(again)
+
+    result = drain_spool(again, spool_directory=spool)
+
+    assert sorted(result.uploaded) == ["call-0", "call-1"]
+
+
+async def test_a_trailing_slash_is_not_a_different_destination(recording, spool):
+    """A guard that cries wolf is a guard that gets disabled."""
+    await recording(1)
+    first = uploader(spool)
+    RecordingTransport(ok_handler).install(first)
+    drain_spool(first, spool_directory=spool, purge=False)
+
+    await recording(2)
+    same = uploader(spool, endpoint=ENDPOINT + "/")
+    RecordingTransport(ok_handler).install(same)
+
+    # call-0 already carries a receipt for the same host written without the
+    # slash, so the pass must both proceed unguarded and honour that receipt.
+    result = drain_spool(same, spool_directory=spool)
+
+    assert result.uploaded == ["call-1"]
+    assert result.skipped == ["call-0"]
+
+
+async def test_a_first_ever_drain_is_not_blocked(recording, spool):
+    """With no prior destination there is no *change* to object to.
+
+    Paired with the control below, which uses the same fixture and differs only
+    in having a prior destination on record: without that pair this asserts
+    nothing, because a spool that was never drained has no ledger either way.
+    """
+    await recording(1)
+    assert not os.path.exists(os.path.join(spool, ".vaani-destinations"))
+    observer = uploader(spool)
+    RecordingTransport(ok_handler).install(observer)
+
+    assert drain_spool(observer, spool_directory=spool).uploaded == ["call-0"]
+
+
+async def test_the_same_spool_is_blocked_once_it_has_a_different_destination(
+    recording, spool
+):
+    """The control for the test above: identical, plus one line of history."""
+    await recording(1)
+    with open(os.path.join(spool, ".vaani-destinations"), "w", encoding="utf-8") as handle:
+        handle.write("https://somewhere.else.example\n")
+    observer = uploader(spool)
+    RecordingTransport(ok_handler).install(observer)
+
+    with pytest.raises(EndpointChanged):
+        drain_spool(observer, spool_directory=spool)
+
+
+async def test_starting_the_agent_against_a_new_endpoint_does_not_authorise_the_drain(
+    recording, spool
+):
+    """Re-pointing and restarting is how an operator changes destination.
+
+    It is also exactly what a typo does. `VAANI_ENDPOINT` is normally set once
+    for both the agent and the drainer, so if the recorder's own startup
+    preflight writes the new host into the ledger, the guard is disarmed by the
+    very action it exists to question -- and the raw audio ships to the typo'd
+    host and is deleted locally, which is the finding verbatim.
+    """
+    await recording(1)
+    with open(os.path.join(spool, ".vaani-destinations"), "w", encoding="utf-8") as handle:
+        handle.write("https://ingest.example.com\n")
+    # The agent is restarted against the new endpoint and writes a call.
+    restarted = VaaniObserver(
+        endpoint="https://ingest.exmaple.com",
+        api_key="test-key",
+        spool_directory=spool,
+        instrumentations={"http": False, "websocket": False},
+    )
+    restarted.preflight()
+
+    observer = uploader(spool, endpoint="https://ingest.exmaple.com")
+    RecordingTransport(ok_handler).install(observer)
+    with pytest.raises(EndpointChanged):
+        drain_spool(observer, spool_directory=spool)
+
+
+async def test_a_confirmed_migration_is_never_purged_by_the_ttl_on_a_later_pass(
+    recording, spool
+):
+    """`--yes` keeps the local copy; a day later that must still be true.
+
+    The confirmed pass writes a receipt naming the new host, and from the next
+    pass onwards the destination is no longer "changed" -- so nothing asks the
+    question again and the TTL quietly deletes the only local copy of calls
+    nobody has yet confirmed arrived anywhere.
+    """
+    await recording(1)
+    with open(os.path.join(spool, ".vaani-destinations"), "w", encoding="utf-8") as handle:
+        handle.write("https://ingest.example.com\n")
+    observer = uploader(spool, endpoint="https://ingest.exmaple.com")
+    RecordingTransport(ok_handler).install(observer)
+    drain_spool(observer, spool_directory=spool, allow_endpoint_change=True)
+    package = os.path.join(spool, "call-0")
+    assert os.path.exists(package), "a confirmed migration keeps the local copy"
+
+    # A later, unremarkable pass to the same host, with the receipt long past
+    # the TTL. Nothing prompts the operator again.
+    receipt = os.path.join(package, RECEIPT_NAME)
+    old = json.loads(open(receipt, encoding="utf-8").read())
+    assert old.get("migration") is True
+    # Age is read from the receipt's own `uploaded_at`, so a day has to pass
+    # there rather than on the filesystem.
+    old["uploaded_at"] = "2020-01-01T00:00:00Z"
+    with open(receipt, "w", encoding="utf-8") as handle:
+        json.dump(old, handle)
+    observer2 = uploader(spool, endpoint="https://ingest.exmaple.com")
+    RecordingTransport(ok_handler).install(observer2)
+    result = drain_spool(observer2, spool_directory=spool, delivered_ttl_s=1)
+    assert result.purged == [], "an unconfirmed migration must not be deleted by a timer"
+    assert os.path.exists(package)
+
+
+def test_a_change_of_host_case_is_not_a_change_of_destination(tmp_path, monkeypatch):
+    """A guard that cries wolf is a guard that gets disabled.
+
+    Scheme and host are case-insensitive per RFC 3986, and a hostname
+    templated from a different source routinely differs only in case.
+    """
+    spool = tmp_path / "spool"
+    package = spool / "call-0"
+    package.mkdir(parents=True)
+    (package / "manifest.json").write_text(json.dumps({"session_id": "call-0"}))
+    (spool / ".vaani-destinations").write_text("http://Localhost:8000\n")
+    observer = uploader(str(spool), endpoint="http://localhost:8000/")
+    RecordingTransport(ok_handler).install(observer)
+
+    drain_spool(observer, spool_directory=str(spool))
+
+
+def test_a_refusal_does_not_kill_a_watching_sidecar(tmp_path, monkeypatch):
+    """Exiting on refusal makes the guard cause the loss it exists to prevent.
+
+    A supervised sidecar would re-exit forever, nothing would ever drain, and
+    the spool would fill unboundedly. A refusal means "not shipping yet".
+    """
+    spool = tmp_path / "spool"
+    package = spool / "call-0"
+    package.mkdir(parents=True)
+    (package / "manifest.json").write_text(json.dumps({"session_id": "call-0"}))
+    (spool / ".vaani-destinations").write_text("https://ingest.example.com\n")
+    monkeypatch.setenv("VAANI_ENDPOINT", "https://ingest.exmaple.com")
+    monkeypatch.setenv("VAANI_API_KEY", "test-key")
+
+    slept: list[float] = []
+
+    def fake_sleep(seconds):
+        slept.append(seconds)
+        if len(slept) >= 2:
+            raise KeyboardInterrupt
+        return None
+
+    monkeypatch.setattr("vaani_observer.drain.time.sleep", fake_sleep)
+    assert drain_main(["--spool", str(spool), "--watch", "1"]) == 0
+    assert len(slept) == 2, "the loop must keep running after a refusal"
+
+
+def test_the_cli_refuses_a_changed_endpoint_with_a_nonzero_status(tmp_path, monkeypatch):
+    """A supervisor must not read a refused exfiltration as a clean pass."""
+    spool = tmp_path / "spool"
+    package = spool / "call-0"
+    package.mkdir(parents=True)
+    (package / "manifest.json").write_text(json.dumps({"session_id": "call-0"}))
+    (spool / ".vaani-destinations").write_text("https://ingest.example.com\n")
+    monkeypatch.setenv("VAANI_ENDPOINT", "https://ingest.exmaple.com")
+    monkeypatch.setenv("VAANI_API_KEY", "test-key")
+
+    assert drain_main(["--spool", str(spool)]) == 2
+    assert (package / "manifest.json").exists()
+
+
+def test_the_drainer_never_patches_the_host_processs_http_clients(tmp_path, monkeypatch):
+    """A drainer's only outbound traffic is the upload.
+
+    `from_env` turns the HTTP and WebSocket instrumentation on by default, so
+    the env-configured CLI path used to monkeypatch every client in whatever
+    process ran it -- a sidecar patching itself to observe its own uploads,
+    and, because the patch is global and refcounted, one that outlives the
+    pass.
+    """
+    import httpx
+
+    from vaani_observer.drain import _build_observer
+
+    original = httpx.AsyncClient.send
+    monkeypatch.setenv("VAANI_ENDPOINT", "https://ingest.example.com")
+    monkeypatch.setenv("VAANI_API_KEY", "test-key")
+
+    class Args:
+        endpoint = None
+        api_key = None
+        spool = str(tmp_path / "spool")
+
+    observer = _build_observer(Args())
+
+    assert httpx.AsyncClient.send is original
+    assert observer.options["instrumentations"] == {"http": False, "websocket": False}

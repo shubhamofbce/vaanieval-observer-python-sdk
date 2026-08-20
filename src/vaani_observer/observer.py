@@ -165,6 +165,46 @@ class VaaniObserver:
 
     # -------------------------------------------------------------- sessions
 
+    def preflight(self) -> Optional[str]:
+        """Check the spool is usable, returning why it is not.
+
+        Every recording is written to the spool directory before it is uploaded,
+        and that directory is created on the writer thread when the first call
+        starts. On a read-only container filesystem -- the normal shape of a
+        hardened production deployment -- the failure therefore happened after
+        `start_session()` had already returned a healthy-looking recorder, and
+        surfaced only as a warning at the end of the first call, by which point
+        the call was over and its evidence unrecoverable.
+
+        Probing here converts that into a startup error, at the moment an
+        operator is still watching. Returns `None` when the spool is writable.
+        """
+        directory = self.options["spool_directory"]
+        probe = os.path.join(directory, ".vaani-write-probe")
+        try:
+            os.makedirs(directory, exist_ok=True)
+            with open(probe, "wb") as handle:
+                handle.write(b"")
+        except OSError as error:
+            return (
+                f"spool directory {directory!r} is not writable ({error.strerror or error}). "
+                "Set VAANI_SPOOL_DIR to a writable path -- on a read-only "
+                "container filesystem, mount a volume or use /tmp."
+            )
+        finally:
+            try:
+                os.unlink(probe)
+            except OSError:
+                pass
+        # Deliberately does *not* record this endpoint in the spool's
+        # destination ledger. `VAANI_ENDPOINT` is normally set once for both the
+        # agent and the drainer, so re-pointing and restarting the agent -- the
+        # ordinary way an operator changes destination, and the same thing a
+        # typo does -- would write the new host here and silently pre-authorise
+        # the drain that the ledger exists to question. The ledger records where
+        # data has actually been *sent*, and only `drain_spool` can know that.
+        return None
+
     @classmethod
     def from_env(cls, **overrides: Any) -> Optional["VaaniObserver"]:
         """Build an observer from `VAANI_*` variables, or `None` if unconfigured.

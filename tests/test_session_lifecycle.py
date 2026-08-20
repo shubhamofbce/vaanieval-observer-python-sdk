@@ -5,6 +5,8 @@ Mirrors nodejs-sdk/test/session-lifecycle.test.js.
 
 from __future__ import annotations
 
+import vaani_observer
+
 import asyncio
 import os
 import re
@@ -49,7 +51,12 @@ async def test_writes_a_complete_manifest_for_a_finalized_session(new_observer):
     assert (result.session_id, result.directory) == ("call-1", session.directory)
     manifest = read_manifest(result.directory)
     assert manifest["schema_version"] == "1.0"
-    assert manifest["sdk"] == {"name": "@vaanieal/observer", "language": "python", "version": "0.1.0"}
+    # Pinned to the packaged version, not to a literal: a package that cannot
+    # be traced to the build that wrote it is not evidence of anything.
+    assert manifest["sdk"] == {
+        "name": "@vaanieal/observer", "language": "python",
+        "version": vaani_observer.__version__,
+    }
     assert manifest["session_id"] == "call-1"
     assert manifest["agent_id"] == "support"
     assert manifest["metadata"] == {"env": "test", "region": "in"}
@@ -71,6 +78,7 @@ async def test_reports_instrumentation_state_through_capture_status(new_observer
     assert first.manifest["capture_status"] == {
         "events_complete": True,
         "audio_complete": True,
+        "coverage_complete": True,
         "http_instrumentation": "disabled",
         "websocket_instrumentation": "active",
         "dropped_event_count": 0,

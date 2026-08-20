@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vaanieval-observer"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Framework-independent voice-call observability SDK"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -21,7 +21,10 @@ dependencies = []
 # The SDK instruments these when they are present but never requires them.
 httpx = ["httpx>=0.24"]
 aiohttp = ["aiohttp>=3.9"]
-livekit = ["livekit-agents>=1.0"]
+# `SpeechHandle.chat_items` landed in 1.2.0, and reply attribution is built on
+# it: below that the identity match silently never fires, so an ordinary
+# barge-in falls through to inference and downgrades an otherwise complete call.
+livekit = ["livekit-agents>=1.2"]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "httpx>=0.24", "aiohttp>=3.9"]
 
 [tool.hatch.build.targets.wheel]
@@ -31,3 +34,6 @@ packages = ["src/vaani_observer"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 filterwarnings = ["error::RuntimeWarning"]
+
+[tool.hatch.version]
+path = "src/vaani_observer/_version.py"

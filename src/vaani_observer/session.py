@@ -29,6 +29,7 @@ from ._payload import (
     sha256,  # re-exported: the upload path checksums objects with it
 )
 from ._writer import SpoolWriter
+from ._version import __version__
 
 logger = logging.getLogger("vaani_observer")
 
@@ -37,7 +38,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 __all__ = ["Session", "Operation", "Turn", "FinalizedSession", "sha256"]
 
-SDK = {"name": "@vaanieal/observer", "language": "python", "version": "0.1.0"}
+SDK = {"name": "@vaanieal/observer", "language": "python", "version": __version__}
 
 OPERATION_TYPES = ("stt", "llm", "tts", "tool")
 TRACKS = ("caller", "agent")
@@ -276,6 +277,13 @@ class Session:
         self.capture_status: Dict[str, Any] = {
             "events_complete": True,
             "audio_complete": True,
+            # `events_complete` and `audio_complete` describe *transport*: they
+            # mean "everything we were handed was written". They cannot see a
+            # stage the SDK was never told about, so a provider that emitted no
+            # metrics produced a package missing 100% of that stage while both
+            # flags stayed true. `coverage_complete` describes *observability*:
+            # whether what we recorded accounts for what demonstrably happened.
+            "coverage_complete": True,
             "http_instrumentation": "active" if instrumentations["http"] else "disabled",
             "websocket_instrumentation": "active" if instrumentations["websocket"] else "disabled",
             "dropped_event_count": 0,
@@ -526,6 +534,40 @@ class Session:
         with self._lock:
             self.capture_status["audio_complete"] = False
             self.capture_status["dropped_audio_chunk_count"] += 1
+
+    def report_coverage_gap(self, stage: str, reason: str, **facts: Any) -> None:
+        """Record that something observably happened which we did not capture.
+
+        This is the difference between "we wrote everything we were given" and
+        "what we wrote accounts for the call". An integration that can *prove*
+        a stage ran -- because it taped the audio that stage produced -- and
+        finds no span for it must say so here, so the gap travels with the
+        package as a fact instead of being invisible.
+
+        Deliberately additive and never self-clearing: a gap once observed is
+        part of the call's permanent record.
+        """
+        with self._lock:
+            self.capture_status["coverage_complete"] = False
+            gaps = self.capture_status.setdefault("coverage_gaps", [])
+            gaps.append({"stage": stage, "reason": reason, **facts})
+
+    def report_capture_measurement(self, **facts: Any) -> None:
+        """Record what the recorder itself measured about the call.
+
+        Distinct from a coverage gap, and the reason zero spans is not one
+        answer but two. An empty call can mean the capture failed or it can mean
+        the agent never spoke -- the single most consequential voice-agent
+        failure there is -- and only the recorder's own audio tap can tell those
+        apart. Publishing the measurement lets the console name the real story
+        instead of pointing an operator at the SDK.
+
+        Never affects `*_complete`: this is evidence about the call, not a
+        verdict about the capture.
+        """
+        with self._lock:
+            measured = self.capture_status.setdefault("measured", {})
+            measured.update(facts)
 
     def _degrade(self, filename: str) -> None:
         if filename in TEMP_TRACK_FILES.values():

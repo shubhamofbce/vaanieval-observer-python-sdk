@@ -33,9 +33,16 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from .observer import VaaniObserver, upload_options_from_env
+from ._spool import known_destinations, normalize_endpoint, remember_destination
 from .session import FinalizedSession
 
-__all__ = ["pending_packages", "drain_spool", "DrainResult", "main"]
+__all__ = [
+    "pending_packages",
+    "drain_spool",
+    "DrainResult",
+    "EndpointChanged",
+    "main",
+]
 
 logger = logging.getLogger("vaani_observer.drain")
 
@@ -59,10 +66,21 @@ DEFAULT_DELIVERED_TTL_S = 24 * 3600
 DEFAULT_PACKAGE_TIMEOUT_S = 1800.0
 
 
+class EndpointChanged(Exception):
+    """Raised when a drain would ship a spool somewhere it has never been.
+
+    Deliberately fatal rather than a warning. The packages contain raw call
+    audio and whatever the caller said, the receiving end needs no
+    authentication by default, and a successful upload is what authorises
+    deleting the local copy -- so by the time a warning is read, the mistake is
+    irreversible. Refusing costs one flag; proceeding can cost the recordings
+    and disclose them.
+    """
+
+
 @dataclass
 class DrainResult:
     """What one pass over the spool did."""
-
     uploaded: List[str]
     failed: List[str]
     skipped: List[str]
@@ -119,7 +137,17 @@ def _receipt_proves(directory: str, endpoint: Optional[str]) -> bool:
     stranded, which is recoverable; deleting it is not.
     """
     covered, receipt = _read_receipt(directory, endpoint)
-    return covered and isinstance(receipt, dict) and bool(receipt.get("endpoint"))
+    if not covered or not isinstance(receipt, dict) or not receipt.get("endpoint"):
+        return False
+    if receipt.get("migration"):
+        # Written by a `--yes` pass to a destination this spool had never used.
+        # That pass deliberately kept the local copy because nobody had yet
+        # confirmed anything arrived at the new host -- and a receipt is written
+        # on a 2xx, which a typo'd host can also return. Letting the TTL purge
+        # honour it would destroy the evidence a day later, with no second
+        # prompt and for exactly the same unverified reason.
+        return False
+    return True
 
 
 def _read_receipt(directory: str, endpoint: Optional[str]) -> "tuple[bool, Any]":
@@ -140,7 +168,7 @@ def _read_receipt(directory: str, endpoint: Optional[str]) -> "tuple[bool, Any]"
     recorded = receipt.get("endpoint")
     if not recorded:
         return True, receipt
-    return str(recorded).rstrip("/") == str(endpoint).rstrip("/"), receipt
+    return normalize_endpoint(recorded) == normalize_endpoint(endpoint), receipt
 
 
 def _scan(spool_directory: str, endpoint: Optional[str] = None) -> "tuple[List[FinalizedSession], List[str]]":
@@ -207,12 +235,16 @@ def drain_spool(
     timeout: Optional[float] = None,
     purge: bool = True,
     delivered_ttl_s: Optional[float] = DEFAULT_DELIVERED_TTL_S,
+    allow_endpoint_change: bool = False,
 ) -> DrainResult:
     """Upload every pending package once.
 
     Failures are recorded and the pass continues: one unshippable call must not
     strand the calls queued behind it. The package stays on the spool, so the
     next pass retries it.
+
+    Raises `EndpointChanged` when the spool has been used with a different
+    destination and `allow_endpoint_change` is not set.
     """
     vaani = observer or VaaniObserver.from_env()
     if vaani is None:
@@ -222,7 +254,30 @@ def drain_spool(
     directory = spool_directory or vaani.options["spool_directory"]
     endpoint = vaani.options.get("endpoint")
     packages, delivered = _scan(directory, endpoint)
+    changed = _endpoint_change(directory, endpoint)
+    if changed and packages and not allow_endpoint_change:
+        raise EndpointChanged(
+            f"{directory} has previously been used with {', '.join(changed)} but this "
+            f"pass is configured for {normalize_endpoint(endpoint)}. {len(packages)} "
+            "package(s) hold raw call audio and caller speech; uploading them would "
+            "disclose that to a host this spool has never shipped to. Confirm with "
+            "--yes if the change is intended, or correct VAANI_ENDPOINT."
+        )
     result = DrainResult(uploaded=[], failed=[], skipped=delivered)
+    # A confirmed migration still keeps the local copies of what it ships. The
+    # operator has not yet been able to check that anything arrived at the new
+    # host, and deleting the only copy of a call on the strength of a 2xx from a
+    # destination that has never been used before is not a trade worth making.
+    # The TTL purge below is left armed: it is already scoped to receipts from
+    # the *current* endpoint, so on a changed one it correctly removes nothing.
+    purge_uploaded = purge and not changed
+    if changed:
+        logger.warning(
+            "Draining %s to a new destination %s; keeping local copies. Re-run "
+            "once you have confirmed the calls arrived to reclaim the disk.",
+            directory,
+            normalize_endpoint(endpoint),
+        )
     # A package uploaded in-process by `finish()` gets a receipt and is then
     # skipped by every later pass -- forever. At ~28 MB per 5-minute call that
     # fills the disk of any worker that records all day, which is every worker.
@@ -242,14 +297,32 @@ def drain_spool(
             )
             result.failed.append(package.session_id)
             continue
-        _acknowledge(package, response, purge=purge, endpoint=endpoint)
+        _acknowledge(package, response, purge=purge_uploaded, endpoint=endpoint,
+                     migration=bool(changed))
+        remember_destination(directory, endpoint)
         logger.info("Uploaded %s", package.session_id)
         result.uploaded.append(package.session_id)
     return result
 
 
+def _endpoint_change(spool_directory: str, endpoint: Optional[str]) -> List[str]:
+    """The destinations this spool knows, when the configured one is not among them.
+
+    Empty when there is nothing to object to -- no endpoint configured, no prior
+    record, or the current endpoint already known. A spool that has legitimately
+    served two hosts stays quiet for both, so a fleet mid-migration does not have
+    to pass a confirmation flag forever.
+    """
+    current = normalize_endpoint(endpoint)
+    if not current:
+        return []
+    known = known_destinations(spool_directory)
+    return [] if not known or current in known else known
+
+
 def _acknowledge(
-    package: FinalizedSession, response: Any, *, purge: bool, endpoint: Optional[str] = None
+    package: FinalizedSession, response: Any, *, purge: bool,
+    endpoint: Optional[str] = None, migration: bool = False,
 ) -> None:
     """Make a delivered package idempotent for future passes.
 
@@ -271,6 +344,8 @@ def _acknowledge(
     # not tell" -- the purge treats an unprovenanced receipt as not-evidence.
     if endpoint:
         receipt["endpoint"] = str(endpoint)
+    if migration:
+        receipt["migration"] = True
     try:
         with open(os.path.join(package.directory, RECEIPT_NAME), "w", encoding="utf-8") as handle:
             json.dump(receipt, handle)
@@ -296,8 +371,12 @@ def _build_observer(args: Any) -> VaaniObserver:
         options["upload"] = upload_options_from_env()
         return VaaniObserver(**options)
     # Fall back to the environment, then re-apply any explicit overrides so a
-    # flag always wins over a variable.
-    vaani = VaaniObserver.from_env()
+    # flag always wins over a variable. Instrumentation is forced off on this
+    # path too: `from_env` enables the HTTP and WebSocket patches by default,
+    # and a drainer is a process whose only outbound traffic *is* the upload --
+    # instrumenting it means the tool patches every client in the host process
+    # to observe itself.
+    vaani = VaaniObserver.from_env(instrumentations={"http": False, "websocket": False})
     if vaani is None:
         raise SystemExit(
             "No destination configured. Set VAANI_ENDPOINT and VAANI_API_KEY, "
@@ -336,6 +415,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     parser.add_argument("--watch", type=float, metavar="SECONDS", default=None,
                         help="Keep running, re-scanning the spool every SECONDS")
+    parser.add_argument(
+        "--yes", action="store_true",
+        help=(
+            "Confirm uploading to an endpoint this spool has not been used with "
+            "before. Required for that case because packages contain raw call "
+            "audio and caller speech."
+        ),
+    )
     parser.add_argument("--verbose", action="store_true", help="Log every package")
     args = parser.parse_args(argv)
 
@@ -353,15 +440,33 @@ def main(argv: Optional[List[str]] = None) -> int:
             timeout=args.timeout or None,
             purge=not args.keep,
             delivered_ttl_s=args.delivered_ttl * 3600,
+            allow_endpoint_change=args.yes,
         )
         print(f"{directory}: {result}")
         return result
 
     if args.watch is None:
-        return 0 if once().ok else 1
+        try:
+            return 0 if once().ok else 1
+        except EndpointChanged as error:
+            # Printed rather than raised so the operator reads the remedy
+            # instead of a traceback, and non-zero so a sidecar's supervisor
+            # does not treat a refused exfiltration as a clean pass.
+            print(f"refusing to drain: {error}")
+            return 2
     try:
         while True:
-            once()
+            try:
+                once()
+            except EndpointChanged as error:
+                # Inside the loop, deliberately. Exiting here killed the
+                # sidecar permanently: under a supervisor it would re-exit
+                # forever, nothing would ever drain, and the spool would fill
+                # unboundedly -- the guard causing the data loss it exists to
+                # prevent. A refusal means "not shipping yet", so it is logged
+                # loudly and retried, giving the operator time to fix
+                # VAANI_ENDPOINT or pass --yes without losing any calls.
+                print(f"refusing to drain: {error}")
             time.sleep(max(1.0, args.watch))
     except KeyboardInterrupt:  # pragma: no cover - operator interrupt
         return 0

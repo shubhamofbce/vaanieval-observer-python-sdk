@@ -29,6 +29,7 @@ from __future__ import annotations
 import logging
 from types import SimpleNamespace
 
+import os
 import pytest
 
 from conftest import operations, read_events
@@ -329,6 +330,38 @@ def test_enabled_but_broken_configuration_is_reported_at_error(monkeypatch, capl
     assert rec.enabled is False
     assert rec.last_error is not None
     assert any(record.levelno >= logging.ERROR for record in caplog.records)
+
+
+@pytest.mark.skipif(
+    getattr(os, "geteuid", lambda: 1)() == 0,
+    reason="root ignores the read-only mode bits this test relies on, so it would "
+           "fail for a reason unrelated to the behaviour under test -- and a red "
+           "suite that says nothing about correctness is the thing to avoid here",
+)
+def test_a_read_only_spool_disables_recording_at_startup_not_after_the_first_call(
+    monkeypatch, caplog, tmp_path
+):
+    """The spool directory used to be created on the writer thread, so a
+    read-only container filesystem -- the normal shape of a hardened production
+    deployment -- produced a recorder that looked healthy, recorded a whole
+    call, and only admitted at `finish()` that none of it was ever written.
+
+    An operator watching their agent start up is told now, while the failure is
+    still cheap."""
+    read_only = tmp_path / "locked"
+    read_only.mkdir()
+    read_only.chmod(0o500)
+    monkeypatch.setenv("VAANI_ENABLED", "true")
+    monkeypatch.setenv("VAANI_SPOOL_DIR", str(read_only / "spool"))
+    try:
+        with caplog.at_level(logging.ERROR, logger="vaani_observer.livekit"):
+            rec = VaaniLiveKitRecorder.from_env()
+        assert rec.enabled is False
+        assert "not writable" in (rec.last_error or "")
+        assert "VAANI_SPOOL_DIR" in rec.last_error
+        assert any(record.levelno >= logging.ERROR for record in caplog.records)
+    finally:
+        read_only.chmod(0o700)
 
 
 def test_connection_capture_stays_off_until_endpoints_are_configured(monkeypatch):

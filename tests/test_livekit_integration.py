@@ -2558,13 +2558,15 @@ async def test_a_call_whose_streams_were_all_identified_says_so(recorder, monkey
     assert measured["stream_ownership"] == "proved", measured
 
 
-async def test_an_ordinary_sequential_call_still_places_unidentified_metrics(recorder):
-    """Refusing every metric that cannot name its reply is the safe reading,
-    and it is also wrong: on a plugin that never sets `speech_id` the previous
-    reply always finishes as the next one opens, so a blanket rule would drop
-    *every* metric on a healthy call -- reintroducing the audit's P0-A by
-    caution instead of by bug. A reply that already received its own metric is
-    not waiting for another, which is what makes this case unambiguous."""
+async def test_an_unnamed_metric_is_dropped_but_its_reply_is_still_published(recorder):
+    """Once a second reply exists, a metric that cannot name its reply is
+    genuinely ambiguous: `llm` and `tts` metrics are additive, so the reply
+    that just ended may still owe one. The metric is refused.
+
+    What must survive is the *reply*. The span is rebuilt from the tape and the
+    transcript, marked estimated, and the loss is named -- so the failure mode
+    is a disclosed missing character count, never a missing reply (the audit's
+    P0-A) and never a character count billed to the wrong turn."""
     rec = recorder()
     session = FakeAgentSession()
     rec.attach(session)
@@ -2581,13 +2583,27 @@ async def test_an_ordinary_sequential_call_still_places_unidentified_metrics(rec
     await rec.finish()
 
     spans = {o["turn_id"]: o for o in _all_of_type(rec, "tts")}
-    assert len(spans) == 2, spans
-    for turn_id, span in spans.items():
-        assert (span.get("response") or {}).get("characters_count") is not None, (
-            f"{turn_id} lost its provider measurement to an over-strict rule: {span}"
-        )
+    assert len(spans) == 2, "a refused metric must never cost a reply its span"
+    first = spans["turn-1"].get("response") or {}
+    assert first.get("characters_count") is not None, (
+        f"the opening reply had no competitor and must keep its metric: {first}"
+    )
+    second = spans["turn-2"].get("response") or {}
+    assert second.get("characters_count") is None, (
+        "this metric could equally have been the previous reply's second "
+        f"segment; publishing it here bills one reply for another: {second}"
+    )
+    assert second.get("text") == "the second answer", second
+    assert second.get("played_ms") == 1000, (
+        f"the reply's duration is measured from its own audio: {second}"
+    )
+    assert second.get("estimated") is True, (
+        f"a rebuilt span must not present itself as a measured one: {second}"
+    )
     gaps = _manifest_of(rec)["capture_status"].get("coverage_gaps") or []
-    assert not any("speech_id" in str(g) for g in gaps), gaps
+    assert any(g.get("stage") == "tts" and "speech_id" in str(g) for g in gaps), (
+        f"the refusal must be declared, not silent: {gaps}"
+    )
 
 
 async def test_a_dropped_metric_reports_the_stage_it_came_from(recorder, monkeypatch):
@@ -2756,6 +2772,64 @@ async def test_audio_placed_without_a_stream_token_is_reported_as_inferred(recor
     measured = _manifest_of(rec)["capture_status"]["measured"]
     assert measured["stream_ownership"] == "inferred", (
         f"this audio was placed by timing, not by identity: {measured}"
+    )
+
+
+async def test_a_span_ended_by_an_error_cannot_forgive_its_own_audio(recorder):
+    """The write-off measures a residual against what a span published. A span
+    ended by the error path never publishes that accounting, so its baseline is
+    zero -- which reads as "every millisecond of this reply arrived after it
+    was published" and forgives a whole reply's worth of speech that no
+    operation accounts for, behind a complete-looking call."""
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_input_transcribed", transcript("hello", True))
+    session.emit("speech_created", speech_created(FakeSpeechHandle("s1")))
+    session.emit("metrics_collected", tts_metrics("s1"))
+    # Untokenized audio, so it would otherwise be eligible for the allowance.
+    rec.tap_output_frame(agent_frame(800))
+    session.emit("error", SimpleNamespace(error=RuntimeError("tts socket reset"),
+                                          source=None))
+    await rec.finish()
+
+    measured = _manifest_of(rec)["capture_status"]["measured"]
+    assert measured["tail_written_off_ms"] == 0, (
+        "a span that published no accounting offers nothing to measure a "
+        f"residual against; forgiving it hides a whole reply: {measured}"
+    )
+    assert measured["unattributed_agent_audio_ms"] >= 800, measured
+
+
+async def test_a_stream_that_never_speaks_does_not_downgrade_the_call(recorder,
+                                                                     monkeypatch):
+    """`stream_ownership` says whether per-turn numbers rest on identity or on
+    timing. A `tts_node` invocation that is cancelled before yielding a frame
+    placed no audio at all, so it moved no number -- reporting `inferred` for
+    it would make the flag mean "something might have happened", and a flag
+    that fires on healthy calls is one operators learn to ignore."""
+    from vaani_observer.integrations import livekit as lk
+
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_input_transcribed", transcript("hello", True))
+    h1 = FakeSpeechHandle("s1")
+    session.emit("speech_created", speech_created(h1))
+    monkeypatch.setattr(lk, "_current_speech_handle", lambda: h1)
+    spoken = rec.open_output_stream()
+    rec.tap_output_frame(agent_frame(1000), spoken)
+    # A second invocation with no context to name its reply -- cancelled before
+    # it renders anything.
+    monkeypatch.setattr(lk, "_current_speech_handle", lambda: None)
+    silent = rec.open_output_stream()
+    rec.close_output_stream(silent)
+    session.emit("conversation_item_added", chat_item("assistant", "an answer"))
+    await rec.finish()
+
+    measured = _manifest_of(rec)["capture_status"]["measured"]
+    assert measured["stream_ownership"] == "proved", (
+        f"no audio was placed by timing, so nothing here was inferred: {measured}"
     )
 
 

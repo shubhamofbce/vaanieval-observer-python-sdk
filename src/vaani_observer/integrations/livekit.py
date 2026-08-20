@@ -79,6 +79,10 @@ _PARTIAL_SAMPLE_LIMIT = 100
 # is treated as truncated. Frames still draining when the last one is tapped,
 # and rounding at both ends, put a small honest gap on every healthy reply.
 _PLAYOUT_TOLERANCE_MS = 250
+# How far a reply's provider-reported duration may fall short of the audio we
+# taped for it before it is treated as still owing a segment. A missing
+# segment is a large share of a reply; ordinary disagreement is a few percent.
+_SEGMENT_SHORTFALL_PCT = 25
 # The most measured agent speech a whole call may write off as boundary jitter
 # before the capture is reported incomplete. A per-turn floor cannot answer
 # "did this call lose data", because that answer is a sum: enough sub-floor
@@ -262,6 +266,7 @@ class _TurnState:
                  "audio_first_at_ms", "finished", "tts_derived", "tts_ttfa_ms",
                  "reply_complete", "tts_text", "tts_reconstructed", "speech_handle",
                  "open_streams", "awaiting_stream_close", "unscoped_audio_bytes",
+                "unscoped_audio_bytes_at_publish",
                  "seq", "finished_at_seq", "metric_stages",
                  "tts_was_derived",
                  "awaiting_reply_item",
@@ -328,6 +333,10 @@ class _TurnState:
         # owner was resolved by timing rather than proved. Only these
         # milliseconds are eligible for the turn-boundary write-off.
         self.unscoped_audio_bytes: int = 0
+        # How much of that had arrived by the time the span was published.
+        # Everything before publication is already inside `played_ms`, so only
+        # the difference can be part of an unexplained residual.
+        self.unscoped_audio_bytes_at_publish: int = 0
         # Creation and completion order, used to tell a metric that plausibly
         # belongs to this turn from one that plausibly belongs to a reply which
         # ended after this turn had already begun.
@@ -878,8 +887,17 @@ class VaaniLiveKitRecorder:
             # jitter -- it is a lifecycle defect, and writing it off would
             # excuse exactly the class of bug this allowance keeps being asked
             # to cover.
-            residual = min(
-                residual, _pcm16_ms(s.unscoped_audio_bytes, rate, channels))
+            # marker:r7-residual-post-publish
+            # The *post-publication* unscoped audio, not the turn's lifetime
+            # total: audio tapped before the span closed is already counted in
+            # `played_ms` and cannot be part of this residual. Using the total
+            # let a turn's early untokenized frames buy forgiveness for later
+            # identified-stream frames -- a lifecycle defect written off as
+            # boundary jitter, which is the one thing this allowance must
+            # never do.
+            residual = min(residual, _pcm16_ms(
+                max(0, s.unscoped_audio_bytes - s.unscoped_audio_bytes_at_publish),
+                rate, channels))
             if residual:
                 tail_ms += residual
                 tail_turns.append(s.id)
@@ -1419,16 +1437,7 @@ class VaaniLiveKitRecorder:
             # `say()` can slip into. Recorded, because a reader cannot
             # otherwise tell an attribution that was proved from one that was
             # inferred, and those do not deserve the same confidence.
-            if not self._stream_ownership_inferred:
-                self._stream_ownership_inferred = True
-                self._warn_once(
-                    "stream_ownership_inferred",
-                    "vaani: this livekit-agents build does not expose the "
-                    "speech-handle context, so a reply's audio is bound to it "
-                    "by timing rather than by identity; per-turn talk time and "
-                    "cost can move between adjacent replies (manifest: "
-                    "capture_status.measured.stream_ownership='inferred')",
-                )
+            self._mark_ownership_inferred()  # marker:r7-warn-consolidated
             self._pin_stream(stream, self._rendering_turn())
         else:
             # Pinned now, not on first output. `tts_node` can be invoked a full
@@ -1454,9 +1463,38 @@ class VaaniLiveKitRecorder:
         self._flush_stream_buffer(stream, owner)
         return owner
 
+    def _mark_ownership_inferred(self) -> None:
+        """Record that some audio was bound to its reply by timing.
+
+        Called from both routes that can do so -- a build without the
+        speech-handle context, and a frame tapped with no stream token at all
+        -- because the manifest's claim is about the *call*, not about which
+        code path made it. Reporting `proved` while a tail was placed by
+        timing is the failure class this field exists to prevent.
+        """
+        if self._stream_ownership_inferred:
+            return
+        self._stream_ownership_inferred = True
+        self._warn_once(
+            "stream_ownership_inferred",
+            "vaani: some agent audio is bound to its reply by timing rather "
+            "than by identity, because this livekit-agents build does not "
+            "expose the speech-handle context or the frame was tapped without "
+            "one; per-turn talk time and cost can move between adjacent "
+            "replies (manifest: capture_status.measured."
+            "stream_ownership='inferred')",
+        )
+
     def _stream_turn(self, stream: "Optional[_OutputStream]") -> "Optional[_TurnState]":
         if stream is None:
-            return self._rendering_turn()
+            # No token at all: whichever reply is rendering *now* gets it. That
+            # is timing, and a reply's own tail draining past the next reply's
+            # start is credited to the wrong one -- so the call may not claim
+            # its per-turn audio was proved.
+            owner = self._rendering_turn()
+            if owner is not None:
+                self._mark_ownership_inferred()
+            return owner
         if stream.owner is not None:
             return stream.owner
         if stream.speech_id is not None:
@@ -2524,7 +2562,7 @@ class VaaniLiveKitRecorder:
         if candidate is not None and any(
                 t is not candidate and t.finished
                 and t.finished_at_seq >= candidate.seq
-                and stage not in t.metric_stages
+                and not self._stage_settled(t, stage)  # marker:r7-settled-rule
                 for t in self._all_turns):
             # A reply ended after this one started and never received a metric
             # for this stage, so a metric arriving now is at least as likely to
@@ -2560,6 +2598,44 @@ class VaaniLiveKitRecorder:
             response=state.stt_response,
             ended_at_ms=state.stt_ended_at,
         )
+
+    def _stage_settled(self, state: "_TurnState", stage: str) -> bool:
+        """Whether a finished reply can still be waiting on a metric.
+
+        A reply that has received every measurement its own tape implies is
+        not a claimant for a metric arriving now; one that is still short of
+        its tape plainly is.
+
+        `tts` metrics are *additive* -- one reply emits one per synthesis
+        segment, and `_record_tts` sums them. So "it already got a metric" is
+        not proof that it got its last one, and treating it as proof let a
+        reply's second segment be added to the reply that followed it: two
+        wrong per-turn numbers, no dropped metric, and therefore no coverage
+        gap to show for it. The tape is the tie-breaker, because it is the one
+        piece of evidence the provider cannot contradict -- a span that
+        published less audio than its turn taped is visibly unfinished.
+        """
+        if stage not in state.metric_stages:
+            return False
+        if stage != "tts":
+            return True
+        rate = self._rate_for("agent") or 1
+        channels = self._channels_for("agent") or 1
+        taped_ms = _pcm16_ms(state.audio_bytes, rate, channels)
+        measured_ms = state.tts_response.get("audio_ms") or 0
+        # Compared against the *provider's* accumulated duration, not against
+        # `published_played_ms`: the published figure is computed from the tape
+        # itself, so it always matches and would make every closed reply look
+        # settled -- including one still missing a segment.
+        #
+        # The allowance is proportional as well as absolute. A shortfall of a
+        # few percent is ordinary disagreement between a synthesizer's own
+        # accounting and the frames we counted; a missing segment is a large
+        # fraction of the reply. Erring wide is deliberate: calling a settled
+        # reply unsettled drops the *next* reply's metric, so a tight bound
+        # would trade a rare misattribution for routine loss.
+        allowance = max(_PLAYOUT_TOLERANCE_MS, taped_ms * _SEGMENT_SHORTFALL_PCT // 100)
+        return measured_ms + allowance >= taped_ms
 
     def _end_tts(self, state: _TurnState, status: str) -> None:
         if (self._capture_transcripts and state.tts_text
@@ -2733,6 +2809,7 @@ class VaaniLiveKitRecorder:
         # fabricated span pass unnoticed, because it is the very thing under
         # audit that decides whether a turn counts as attributed.
         state.published_played_ms = response.get("played_ms") or 0
+        state.unscoped_audio_bytes_at_publish = state.unscoped_audio_bytes  # marker:r7-publish-snapshot
         state.tts.end(status=status, response=response, ended_at_ms=ended_at)
 
     def _finish_turn(self, state: _TurnState) -> None:

@@ -2659,6 +2659,106 @@ async def test_audio_on_an_identified_stream_is_never_written_off_as_jitter(reco
     assert measured["unattributed_agent_audio_ms"] >= 120, measured
 
 
+async def test_a_replys_second_segment_is_never_added_to_the_reply_after_it(recorder):
+    """TTS metrics are additive: one reply emits one per synthesis segment and
+    `_record_tts` sums them. So "this reply already got a metric" is not proof
+    that it got its last one -- and treating it as proof handed a reply's
+    second segment to the reply that followed it. Nothing is dropped, so no
+    coverage gap appears: two wrong per-turn durations and character counts
+    behind a fully healthy call, which is the exact failure class this module
+    exists to refuse."""
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_input_transcribed", transcript("one", True))
+    session.emit("speech_created", speech_created(FakeSpeechHandle("s1")))
+    # Three seconds spoken, but only the first segment measured so far.
+    rec.tap_output_frame(agent_frame(3000))
+    session.emit("metrics_collected", tts_metrics(None, audio_duration=1.0))
+    session.emit("conversation_item_added", chat_item("assistant", "the first answer"))
+    session.emit("user_input_transcribed", transcript("two", True))
+    session.emit("speech_created", speech_created(FakeSpeechHandle("s2")))
+    rec.tap_output_frame(agent_frame(400))
+    # The first reply's remaining segment, arriving late and unnamed.
+    session.emit("metrics_collected", tts_metrics(None, audio_duration=2.0))
+    await rec.finish()
+
+    spans = {o["turn_id"]: o for o in _all_of_type(rec, "tts")}
+    second = spans["turn-2"].get("response") or {}
+    assert (second.get("audio_ms") or 0) < 2000, (
+        "turn-2 spoke 400ms and was credited with the previous reply's "
+        f"segment: {second}"
+    )
+    assert second.get("characters_count") is None, (
+        f"turn-2 was billed for characters another reply synthesized: {second}"
+    )
+    gaps = _manifest_of(rec)["capture_status"].get("coverage_gaps") or []
+    assert any(g.get("stage") == "tts" for g in gaps), (
+        f"a metric that could not name its reply must be declared: {gaps}"
+    )
+
+
+async def test_early_untokenized_audio_never_excuses_a_later_stranded_frame(recorder,
+                                                                           monkeypatch):
+    """The write-off was capped by the turn's *lifetime* unscoped audio, but
+    every frame taped before the span closed is already inside `played_ms` and
+    cannot be part of the residual. So a turn that once took an untokenized
+    frame bought itself an allowance it could spend later -- on audio that
+    named its reply. That is a lifecycle defect wearing boundary jitter's
+    clothes."""
+    from vaani_observer.integrations import livekit as lk
+
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_input_transcribed", transcript("hello", True))
+    h1 = FakeSpeechHandle("s1")
+    session.emit("speech_created", speech_created(h1))
+    monkeypatch.setattr(lk, "_current_speech_handle", lambda: h1)
+    stream = rec.open_output_stream()
+    rec.tap_output_text("a first answer of a reasonable length", stream)
+    rec.tap_output_frame(agent_frame(2000), stream)
+    # An untokenized frame, before the span is published: already accounted for.
+    rec.tap_output_frame(agent_frame(500))
+    session.emit("metrics_collected", tts_metrics("s1"))
+    rec.close_output_stream(stream)
+    session.emit("conversation_item_added",
+                 chat_item("assistant", "a first answer of a reasonable length"))
+    session.emit("speech_created", speech_created(FakeSpeechHandle("s2")))
+    # Stranded afterwards on the stream that names its reply.
+    rec.tap_output_frame(agent_frame(500), stream)
+    await rec.finish()
+
+    measured = _manifest_of(rec)["capture_status"]["measured"]
+    assert measured["tail_written_off_ms"] == 0, (
+        "the residual is identified-stream audio; an earlier untokenized frame "
+        f"is not a licence to forgive it: {measured}"
+    )
+    assert measured["unattributed_agent_audio_ms"] >= 500, measured
+
+
+async def test_audio_placed_without_a_stream_token_is_reported_as_inferred(recorder):
+    """`stream_ownership` answers "was per-turn audio bound by identity or by
+    timing", and a frame tapped with no stream at all is bound by timing --
+    whichever reply is rendering *now* takes it, so a reply's tail draining
+    past the next one's start lands on the wrong turn. Reporting that as
+    `proved` tells a reader the per-turn split is trustworthy when the audit's
+    whole complaint is numbers that do not say how sure they are."""
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_input_transcribed", transcript("hello", True))
+    session.emit("speech_created", speech_created(FakeSpeechHandle("s1")))
+    rec.tap_output_frame(agent_frame(1000))
+    session.emit("conversation_item_added", chat_item("assistant", "an answer"))
+    await rec.finish()
+
+    measured = _manifest_of(rec)["capture_status"]["measured"]
+    assert measured["stream_ownership"] == "inferred", (
+        f"this audio was placed by timing, not by identity: {measured}"
+    )
+
+
 async def test_a_recorder_that_measured_nothing_is_never_called_fully_captured(recorder):
     """With no audio tap, "every millisecond we taped is on a span" is
     trivially true because nothing was taped. Gating that check on whether an

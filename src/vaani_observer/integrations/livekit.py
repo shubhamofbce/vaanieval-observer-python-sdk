@@ -878,12 +878,13 @@ class VaaniLiveKitRecorder:
         # TTS spans and still reported the call fully captured. That is the
         # audit's P0-A signature exactly: audio with no operations behind a
         # green status.
-        # Eligibility is about *unpublished* audio, not about the absence of a
-        # span. A drain tail can land on a turn that already has a span --
-        # frames arriving after its close have nowhere to go, because an
-        # operation is immutable once ended -- and testing `s.tts is None`
-        # sent exactly those milliseconds straight into the gap, so eight
-        # barge-ins leaving 60ms each downgraded an otherwise perfect call.
+        # Eligibility asks whether the turn ever published what its span
+        # accounted for, not whether it has a span. Note what this is *not*
+        # doing: a published turn cannot carry a forgivable residual at all,
+        # because untokenized audio only ever lands on the turn that is still
+        # rendering and publication happens when that turn is retired, so the
+        # cap below is already zero for it. The live case is the error path,
+        # which ends spans directly and publishes nothing -- see below.
         tail_turns = []
         tail_ms = 0
         for s in self._all_turns:

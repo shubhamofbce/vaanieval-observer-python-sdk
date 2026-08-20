@@ -2555,32 +2555,40 @@ async def test_a_stream_that_closes_before_its_turn_exists_still_delivers(
     assert measured["unattributed_agent_audio_ms"] == 0, measured
 
 
-async def test_a_published_span_may_still_absorb_its_own_drain_tail(recorder):
-    """The write-off exists for frames that land on a turn whose span is
-    already ended and therefore immutable. Its test never built that state --
-    120ms of audio is under the playout tolerance, so no span was created at
-    all and the ordinary no-span branch was exercised instead. This builds a
-    genuinely published span first, so the eligibility rule the write-off
-    turns on is the one under test."""
+async def test_a_generator_entered_before_its_speech_event_is_not_retired(recorder,
+                                                                          monkeypatch):
+    """`tts_node` is entered before it yields, and on a busy loop it can be
+    entered before LiveKit dispatches the `speech_created` for the very speech
+    it is rendering. The stream could not be counted against a turn that did
+    not exist yet, so the reply looked idle: the next speech retired it and
+    closed its span, and everything it went on to say landed on an operation
+    that was already ended. Registering the stream at invocation only helps if
+    something resolves it once the turn appears."""
+    from vaani_observer.integrations import livekit as lk
+
     rec = recorder()
     session = FakeAgentSession()
     rec.attach(session)
-    await run_one_turn(rec, session)
-    session.emit("speech_created", speech_created(FakeSpeechHandle("s2")))
-    rec.tap_output_frame(agent_frame(800))
-    session.emit("conversation_item_added", chat_item("assistant", "aur kuch"))
-    session.emit("speech_created", speech_created(FakeSpeechHandle("s3")))
-    second = rec._turns["s2"]
-    assert second.tts is not None and second.publication_snapshot_taken, (
-        "the turn under test must actually have a published span"
+    session.emit("user_input_transcribed", transcript("hello", True))
+    h1 = FakeSpeechHandle("s1")
+    monkeypatch.setattr(lk, "_current_speech_handle", lambda: h1)
+    stream = rec.open_output_stream()  # entered; the speech event has not landed
+    session.emit("speech_created", speech_created(h1))
+    turn_one = rec._turns["s1"]
+    assert turn_one.open_streams == 1, (
+        "the running generator was never counted against its reply"
     )
-    rec.tap_output_frame(agent_frame(120))
+    session.emit("speech_created", speech_created(FakeSpeechHandle("s2")))
+    assert turn_one.finished is False, (
+        "a reply whose generator is still running was retired by the next speech"
+    )
+    rec.tap_output_frame(agent_frame(700), stream)
+    rec.tap_output_text("namaste", stream)
+    rec.close_output_stream(stream)
     await rec.finish()
 
-    capture = _manifest_of(rec)["capture_status"]
-    assert capture["coverage_complete"] is True, capture.get("coverage_gaps")
-    measured = capture["measured"]
-    assert measured["tail_written_off_ms"] >= 120, measured
+    assert turn_one.audio_bytes > 0
+    assert "namaste" in "".join(turn_one.tts_text), turn_one.tts_text
 
 
 async def test_a_reply_is_not_retired_while_its_generator_waits_on_the_llm(

@@ -360,6 +360,23 @@ class _TurnState:
         self.awaiting_reply_item = False
 
 
+def _is_empty_turn(state: "_TurnState") -> bool:
+    """True when a turn has recorded nothing at all.
+
+    A preemptive reply that LiveKit cancelled never speaks and never reports a
+    metric, so its turn stays empty; reusing it keeps the cancelled attempts
+    from surfacing as phantom turns.
+    """
+    return (
+        state.stt is None
+        and not state.llm
+        and state.tts is None
+        and state.audio_bytes == 0
+        and not state.tools
+        and not state.open_streams
+    )
+
+
 class _PendingStt:
     """The provider-neutral STT payload, captured before a turn id exists."""
 
@@ -425,6 +442,10 @@ class VaaniLiveKitRecorder:
         self._turns: Dict[str, _TurnState] = {}
         self._all_turns: List[_TurnState] = []
         self._pending_turn: Optional[_TurnState] = None
+        # A reply LiveKit generated before the transcript it answers went final,
+        # kept with the utterance it was generated from so it cannot be handed
+        # a later one.
+        self._preemptive_turn: Optional[_TurnState] = None
         # Streams that named their speech before that speech was registered.
         self._unpinned_streams: Dict[str, List["_OutputStream"]] = {}
         self._current_turn: Optional[_TurnState] = None
@@ -698,6 +719,13 @@ class VaaniLiveKitRecorder:
         # events LiveKit has already dispatched.
         self.call = None
         self._detach()
+        # Whatever is still waiting for a speech that never registered will
+        # never be resolved now, and its buffers would otherwise be held for
+        # as long as the recorder is. Its audio is already in the call total,
+        # so dropping the reference loses no measurement -- the audit reports
+        # it as unattributed, which is what it is. marker:r9-release-on-finish
+        self._unpinned_streams.clear()
+        self._preemptive_turn = None
         try:
             self.finalize_open_spans(call, outcome=outcome)
             finalized = await call.end(outcome=outcome)
@@ -1362,8 +1390,13 @@ class VaaniLiveKitRecorder:
         """A final transcript ends the user's half of the turn and opens ours."""
         pending = self._pending_stt
         pending.metrics = {**self._stt_identity, **pending.metrics}
+        # A preemptive reply is only ever generated from the utterance that is
+        # still open, and clearing it here is what keeps it from claiming the
+        # next one: it is set while `_pending_stt` is live and consumed the
+        # moment that utterance goes final.
+        state = self._preemptive_turn or self._new_turn()
+        self._preemptive_turn = None
         self._pending_stt = _PendingStt()
-        state = self._new_turn()
         self._pending_turn = state
         self._current_turn = state
         started_at_ms = pending.started_at_ms if pending.started_at_ms is not None else at
@@ -1424,11 +1457,38 @@ class VaaniLiveKitRecorder:
         if speech_id in self._turns:
             self._turns[speech_id].speech_handle = getattr(event, "speech_handle", None)
             self._turns[speech_id].reply_source = source
+            # Also here, not only on the new-state branch. A metric that
+            # carries its speech id registers the turn before this event
+            # arrives, and a stream that had already finished rendering was
+            # then left waiting for a resolution that never came.
+            self._resolve_deferred_streams(speech_id, self._turns[speech_id])
             self._current_turn = self._turns[speech_id]
             self._retire_reply(keep=self._turns[speech_id])
             self._speaking_turn = self._turns[speech_id]
             return
         state = self._pending_turn
+        if state is not None and state.reply_source is not None:
+            # The pending turn already has a reply speech bound to it. That can
+            # only happen after a preemptive reply was merged below, and a
+            # second, unrelated speech must not quietly join it.
+            state = None
+        if state is None and self._pending_stt.started_at_ms is not None:
+            # LiveKit generates a reply from a *predicted* end of turn while the
+            # user is still speaking (`preemptive_generation` is on by default),
+            # so this speech arrives before the final transcript it answers.
+            # Recording it as its own turn splits one exchange in two: the
+            # user's words in a turn with no reply, the reply in a turn with no
+            # question, and no defensible latency between them.
+            # marker:r9-preemptive
+            reuse = self._preemptive_turn
+            if reuse is not None and _is_empty_turn(reuse):
+                # A discarded preemptive attempt is cancelled and regenerated
+                # (up to `max_retries`); the cancelled one never speaks, so
+                # reusing its empty turn avoids leaving phantoms behind.
+                state = reuse
+            else:
+                state = self._new_turn()
+            self._preemptive_turn = state
         if state is None:
             # `say()` and the opening greeting produce a turn with no user
             # speech at all.
@@ -1437,12 +1497,7 @@ class VaaniLiveKitRecorder:
         self._turns[speech_id] = state
         state.speech_handle = getattr(event, "speech_handle", None)
         state.reply_source = source
-        # A `tts_node` invocation can render a whole short reply and return
-        # before this event is dispatched. Its stream named this speech from
-        # the start, so nothing about it was ever ambiguous -- it was only
-        # waiting for the turn to exist. marker:r9-resolve-deferred
-        for deferred in self._unpinned_streams.pop(speech_id, []):
-            self._pin_stream(deferred, state)
+        self._resolve_deferred_streams(speech_id, state)
         self._current_turn = state
         # A new reply supersedes the previous one, so whatever was still
         # draining has now stopped: this is the point at which the last reply's
@@ -1495,6 +1550,19 @@ class VaaniLiveKitRecorder:
             if self._pin_stream(stream, self._turns.get(stream.speech_id)) is None:
                 self._defer_stream(stream)
         return stream
+
+    def _resolve_deferred_streams(self, speech_id: str,
+                                  state: "_TurnState") -> None:
+        """Hand a newly-known turn every stream that was waiting for it.
+
+        A `tts_node` invocation can render a whole short reply and return
+        before LiveKit dispatches the `speech_created` for it. Its stream named
+        this speech from the first frame, so nothing about it was ever
+        ambiguous -- it was only waiting for the turn to exist.
+        marker:r9-resolve-deferred
+        """
+        for deferred in self._unpinned_streams.pop(speech_id, []):
+            self._pin_stream(deferred, state)
 
     def _defer_stream(self, stream: "_OutputStream") -> None:
         """Hold a stream until the speech it named is registered.
@@ -2701,10 +2769,18 @@ class VaaniLiveKitRecorder:
             candidate = None
         if candidate is not None:
             return candidate
-        if not live and self._current_turn is not None:
+        if (not live and self._current_turn is not None
+                and self._could_emit(self._current_turn, stage)):
             # Nothing is open: this is a trailing metric for the reply that
             # just ended, and `_record_tts`/`_record_llm` already recognise and
             # disclose a metric that arrives after its span was published.
+            #
+            # Eligibility is re-checked here and not only above. "No eligible
+            # reply is open" does not make the turn that happens to be current
+            # a legal home -- a say() greeting following a generated reply is
+            # exactly that shape, and it collected the reply's tokens, latency
+            # and cost as a measured span on a turn where no model ever ran.
+            # marker:r9-fallback-eligible
             return self._current_turn
         self._unidentified_metrics[stage] = self._unidentified_metrics.get(stage, 0) + 1
         self._warn_once(

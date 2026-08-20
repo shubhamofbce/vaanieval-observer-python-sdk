@@ -2555,6 +2555,63 @@ async def test_a_stream_that_closes_before_its_turn_exists_still_delivers(
     assert measured["unattributed_agent_audio_ms"] == 0, measured
 
 
+async def test_a_trailing_metric_never_lands_on_a_turn_that_cannot_produce_it(
+        recorder):
+    """Eligibility guarded the candidate search but not the fallback beneath
+    it. When no eligible reply is open the recorder treats an unnamed metric
+    as the trailing measurement of the reply that just ended and publishes it
+    on `_current_turn` -- without asking whether that turn could have produced
+    it. A `say()` greeting following a generated reply therefore collected the
+    reply's LLM tokens, latency and cost as a fully measured span, on a turn
+    where no model was ever called, with no gap to say so."""
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    await run_one_turn(rec, session)
+    greeting = FakeSpeechHandle("g1")
+    session.emit("speech_created", speech_created(greeting, source="say"))
+    rec.tap_output_frame(agent_frame(600))
+    session.emit("conversation_item_added", chat_item("assistant", "aur kuch"))
+    session.emit("metrics_collected", llm_metrics(None))
+    await rec.finish()
+
+    ops = operations(read_events(_dir(rec)))
+    say_turn = rec._turns["g1"].turn.id
+    stray = [o for o in ops if o["type"] == "llm" and o["turn_id"] == say_turn]
+    assert not stray, (
+        "a say() turn was billed for an LLM call it never made: %r" % stray
+    )
+
+
+async def test_a_stream_is_resolved_even_when_a_metric_registered_its_turn(
+        recorder, monkeypatch):
+    """A metric that *does* carry its speech id registers the turn under that
+    id. When `speech_created` then arrives it takes the already-registered
+    branch, which returned without ever looking at the streams waiting for
+    that speech. A reply that finished rendering before its event was
+    dispatched stayed stranded, and its audio and words never reached it."""
+    from vaani_observer.integrations import livekit as lk
+
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_input_transcribed", transcript("hello", True))
+    handle = FakeSpeechHandle("s1")
+    monkeypatch.setattr(lk, "_current_speech_handle", lambda: handle)
+    stream = rec.open_output_stream()
+    rec.tap_output_frame(agent_frame(700), stream)
+    rec.tap_output_text("namaste", stream)
+    rec.close_output_stream(stream)
+    # The named metric registers the turn before LiveKit dispatches the event.
+    session.emit("metrics_collected", llm_metrics("s1"))
+    session.emit("speech_created", speech_created(handle))
+    await rec.finish()
+
+    state = rec._turns["s1"]
+    assert state.audio_bytes > 0, "the reply's audio never reached its own turn"
+    assert "namaste" in "".join(state.tts_text), state.tts_text
+
+
 async def test_a_generator_entered_before_its_speech_event_is_not_retired(recorder,
                                                                           monkeypatch):
     """`tts_node` is entered before it yields, and on a busy loop it can be
@@ -3077,3 +3134,126 @@ async def test_metrics_that_arrive_too_late_to_record_are_declared_missing(recor
     assert capture["coverage_complete"] is False
     assert any("later segments" in g.get("reason", "")
                for g in capture["coverage_gaps"]), capture["coverage_gaps"]
+
+
+# ------------------------------------------------- preemptive reply generation
+
+
+async def _preemptive_reply(session, rec, speech_id, *, final_at_end=True):
+    """The event order LiveKit produces with `preemptive_generation` enabled.
+
+    The reply is generated from a *predicted* end of turn, so `speech_created`
+    arrives while the caller is still speaking -- before the final transcript.
+    """
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("goa ki", False))
+    session.emit("speech_created", speech_created(SimpleNamespace(id=speech_id)))
+    if final_at_end:
+        session.emit("metrics_collected", stt_metrics())
+        session.emit("user_state_changed", SimpleNamespace(new_state="listening"))
+        session.emit("user_input_transcribed", transcript("goa ki flight kitne ki hai", True))
+
+
+async def test_a_preemptively_generated_reply_stays_in_the_turn_it_answers(recorder):
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    await _preemptive_reply(session, rec, "speech-p1")
+    session.emit("metrics_collected", llm_metrics("speech-p1"))
+    rec.tap_output_frame(agent_frame(900))
+    session.emit("metrics_collected", tts_metrics("speech-p1"))
+    session.emit("conversation_item_added", chat_item("assistant", "chhah hazaar"))
+    await rec.finish()
+
+    states = rec._all_turns
+    assert len(states) == 1, "one exchange must not be split across two turns"
+    only = states[0]
+    assert only.stt is not None, "the caller's words belong to the turn that answered them"
+    assert only.llm, "the reply's LLM measurement belongs to the same turn"
+    assert only.tts is not None
+    assert only.audio_bytes > 0
+
+
+async def test_a_cancelled_preemptive_attempt_leaves_no_phantom_turn(recorder):
+    """LiveKit cancels and regenerates a preemptive reply as the transcript
+    grows (`max_retries` is 3). A cancelled attempt never speaks and never
+    reports a metric, so it must not surface as a turn of its own."""
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("goa", False))
+    session.emit("speech_created", speech_created(SimpleNamespace(id="speech-try1")))
+    session.emit("user_input_transcribed", transcript("goa ki flight", False))
+    session.emit("speech_created", speech_created(SimpleNamespace(id="speech-try2")))
+    session.emit("metrics_collected", stt_metrics())
+    session.emit("user_input_transcribed", transcript("goa ki flight kitne ki hai", True))
+    session.emit("metrics_collected", llm_metrics("speech-try2"))
+    rec.tap_output_frame(agent_frame(900))
+    session.emit("metrics_collected", tts_metrics("speech-try2"))
+    await rec.finish()
+
+    assert len(rec._all_turns) == 1, "cancelled attempts must not each become a turn"
+
+
+async def test_a_preemptive_turn_is_released_once_its_utterance_lands(recorder):
+    """The merge is keyed to the utterance the reply was generated from. Once
+    that utterance has been claimed, the *next* one must open its own turn --
+    otherwise a single preemptive reply would swallow the rest of the call.
+
+    (A partial that never reaches a final is not a separate utterance: LiveKit
+    replaces partials in place, so the final that eventually arrives closes the
+    same one. That case merges by design, not by accident.)"""
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    await _preemptive_reply(session, rec, "speech-p1")
+    session.emit("metrics_collected", llm_metrics("speech-p1"))
+    rec.tap_output_frame(agent_frame(900))
+    session.emit("metrics_collected", tts_metrics("speech-p1"))
+    # a second utterance, answered the ordinary way
+    await run_one_turn(rec, session, speech_id="speech-2")
+    await rec.finish()
+
+    states = rec._all_turns
+    assert len(states) == 2, "the next utterance must not join the preemptive turn"
+    assert all(st.stt is not None for st in states)
+    assert all(st.llm for st in states)
+
+
+async def test_back_to_back_preemptive_replies_stay_in_separate_turns(recorder):
+    """`preemptive_generation` is on by default, so *every* exchange can take
+    this path. The second reply's speech is created while the first turn is
+    still the pending one, and it must not join it."""
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    for n, sid in enumerate(("speech-p1", "speech-p2")):
+        await _preemptive_reply(session, rec, sid)
+        session.emit("metrics_collected", llm_metrics(sid))
+        rec.tap_output_frame(agent_frame(600))
+        session.emit("metrics_collected", tts_metrics(sid))
+    await rec.finish()
+
+    states = rec._all_turns
+    assert len(states) == 2, "two exchanges must stay two turns"
+    for st in states:
+        assert st.stt is not None and st.llm and st.tts is not None
+
+
+async def test_a_greeting_before_the_caller_speaks_still_opens_its_own_turn(recorder):
+    """The opening greeting is not preemptive -- nobody has spoken yet -- so it
+    must not swallow the caller's first utterance."""
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("speech_created", speech_created(SimpleNamespace(id="speech-hello")))
+    rec.tap_output_frame(agent_frame(400))
+    session.emit("metrics_collected", tts_metrics("speech-hello"))
+    await run_one_turn(rec, session, speech_id="speech-1")
+    await rec.finish()
+
+    states = rec._all_turns
+    assert len(states) == 2
+    assert states[0].stt is None, "the greeting answers nothing"
+    assert states[1].stt is not None, "the caller's first utterance keeps its own turn"

@@ -2438,15 +2438,14 @@ async def test_a_short_interrupted_tape_never_claims_a_longer_reply(recorder,
     )
 
 
-async def test_drain_frames_landing_on_a_published_span_are_written_off_not_reported_lost(
+async def test_drain_frames_landing_on_a_turn_with_no_span_are_written_off(
         recorder):
-    """Eligibility for the boundary write-off was "this turn has no span",
-    which is the wrong question. A drain tail can land on a turn that already
-    has a published span -- an operation is immutable once ended, so those
-    frames have nowhere to go -- and they went straight into the gap. Eight
-    barge-ins leaving 60ms each then downgraded an otherwise perfect call,
-    while the write-off protected a case the stream token had already made
-    rare."""
+    """The ordinary drain tail: a fragment of the previous reply resolves by
+    timing onto a turn that never speaks and so never opens a span at all.
+    This must stay forgivable. It is deliberately the *narrower* of the two
+    write-off cases -- it was once named for the published-span case and
+    tested neither, since 120ms sits under the playout tolerance and no span
+    is ever built here."""
     rec = recorder()
     session = FakeAgentSession()
     rec.attach(session)
@@ -2465,6 +2464,123 @@ async def test_drain_frames_landing_on_a_published_span_are_written_off_not_repo
     assert "unattributed_agent_audio_ms" in measured, (
         "the residual must be published even when it sits under the tolerance"
     )
+
+
+async def test_a_greeting_never_blocks_the_next_replys_own_llm_metric(recorder):
+    """The refusal rule asks "did another reply finish after this one began",
+    which is stage-blind. `session.say()` synthesises text that was handed to
+    it -- no LLM ever runs for it -- so a greeting cannot be the claimant for
+    an LLM measurement, yet it was counted as one. Since the opening greeting
+    is retired by the very speech that creates the first real reply, its
+    `finished_at_seq` always lands at-or-after that reply's, and so *every*
+    unnamed LLM metric on the first generated reply of an agent that greets
+    was dropped -- the overwhelmingly common LiveKit shape."""
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    greeting = FakeSpeechHandle("greet")
+    session.emit("speech_created", speech_created(greeting, source="say"))
+    session.emit("user_input_transcribed", transcript("kya haal hai", True))
+    reply = FakeSpeechHandle("s2")
+    session.emit("speech_created", speech_created(reply, source="generate_reply"))
+    session.emit("metrics_collected", llm_metrics(None))
+    rec.tap_output_frame(agent_frame(900))
+    session.emit("conversation_item_added", chat_item("assistant", "theek hoon"))
+    await rec.finish()
+
+    ops = operations(read_events(_dir(rec)))
+    llm = [op for op in ops if op["type"] == "llm"]
+    assert llm, "the reply's own LLM metric was refused because a say() greeting existed"
+    assert llm[0]["turn_id"] == rec._turns["s2"].turn.id
+    assert llm[0]["response"].get("total_tokens") == 120, llm[0]["response"]
+    gaps = _manifest_of(rec)["capture_status"].get("coverage_gaps", [])
+    assert not [g for g in gaps if g.get("stage") == "llm"], gaps
+
+
+async def test_a_superseded_user_turn_never_becomes_a_phantom_claimant(recorder):
+    """Two final transcripts before any reply -- an endpoint that fires twice,
+    which LiveKit answers with a single reply -- replaced `_pending_turn`
+    while the first state stayed live in `_all_turns` forever. It can never be
+    retired, because retirement runs off the *speaking* turn and this one
+    never spoke. From then on every unnamed LLM or TTS metric saw two live
+    turns and was refused for the rest of the call: one dropped endpoint
+    silently stopped the call from measuring anything again."""
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_input_transcribed", transcript("goa ki", True))
+    session.emit("user_input_transcribed", transcript("flight kitne ki hai", True))
+    reply = FakeSpeechHandle("s1")
+    session.emit("speech_created", speech_created(reply))
+    session.emit("metrics_collected", llm_metrics(None))
+    rec.tap_output_frame(agent_frame(900))
+    session.emit("conversation_item_added", chat_item("assistant", "dus hazaar"))
+    await rec.finish()
+
+    ops = operations(read_events(_dir(rec)))
+    llm = [op for op in ops if op["type"] == "llm"]
+    assert llm, "a superseded pending turn stayed live and refused the reply's metric"
+    assert llm[0]["turn_id"] == rec._turns["s1"].turn.id
+
+
+async def test_a_stream_that_closes_before_its_turn_exists_still_delivers(
+        recorder, monkeypatch):
+    """`tts_node` can be entered, render a short reply and return before
+    LiveKit's `speech_created` for it is dispatched. The stream knew its
+    speech id the whole time, so nothing was ever ambiguous -- but the buffer
+    was only flushed by a *later* frame, and there is no later frame. The
+    reply's audio and its words were dropped from the turn and resurfaced as
+    unattributed audio: a complete reply, provably owned, lost to ordering."""
+    from vaani_observer.integrations import livekit as lk
+
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_input_transcribed", transcript("hello", True))
+    handle = FakeSpeechHandle("s1")
+    monkeypatch.setattr(lk, "_current_speech_handle", lambda: handle)
+    stream = rec.open_output_stream()
+    rec.tap_output_frame(agent_frame(700), stream)
+    rec.tap_output_text("namaste", stream)
+    rec.close_output_stream(stream)
+    session.emit("speech_created", speech_created(handle))
+    await rec.finish()
+
+    state = rec._turns["s1"]
+    assert state.audio_bytes > 0, (
+        "the reply's audio never reached the turn that provably owned it"
+    )
+    assert "namaste" in "".join(state.tts_text), state.tts_text
+    measured = _manifest_of(rec)["capture_status"]["measured"]
+    assert measured["unattributed_agent_audio_ms"] == 0, measured
+
+
+async def test_a_published_span_may_still_absorb_its_own_drain_tail(recorder):
+    """The write-off exists for frames that land on a turn whose span is
+    already ended and therefore immutable. Its test never built that state --
+    120ms of audio is under the playout tolerance, so no span was created at
+    all and the ordinary no-span branch was exercised instead. This builds a
+    genuinely published span first, so the eligibility rule the write-off
+    turns on is the one under test."""
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    await run_one_turn(rec, session)
+    session.emit("speech_created", speech_created(FakeSpeechHandle("s2")))
+    rec.tap_output_frame(agent_frame(800))
+    session.emit("conversation_item_added", chat_item("assistant", "aur kuch"))
+    session.emit("speech_created", speech_created(FakeSpeechHandle("s3")))
+    second = rec._turns["s2"]
+    assert second.tts is not None and second.publication_snapshot_taken, (
+        "the turn under test must actually have a published span"
+    )
+    rec.tap_output_frame(agent_frame(120))
+    await rec.finish()
+
+    capture = _manifest_of(rec)["capture_status"]
+    assert capture["coverage_complete"] is True, capture.get("coverage_gaps")
+    measured = capture["measured"]
+    assert measured["tail_written_off_ms"] >= 120, measured
 
 
 async def test_a_reply_is_not_retired_while_its_generator_waits_on_the_llm(

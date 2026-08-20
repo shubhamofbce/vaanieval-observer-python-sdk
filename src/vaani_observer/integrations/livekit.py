@@ -265,6 +265,7 @@ class _TurnState:
                  "tts_response", "tts_ended_at", "tools", "audio_bytes",
                  "audio_first_at_ms", "finished", "tts_derived", "tts_ttfa_ms",
                  "reply_complete", "tts_text", "tts_reconstructed", "speech_handle",
+                 "reply_source",
                  "open_streams", "awaiting_stream_close", "unscoped_audio_bytes",
                 "unscoped_audio_bytes_at_publish", "publication_snapshot_taken",
                  "seq", "finished_at_seq",
@@ -323,6 +324,10 @@ class _TurnState:
         # assistant conversation item can be matched to the speech that made it
         # by identity rather than by guessing from timing.
         self.speech_handle: Any = None
+        # How LiveKit created this turn's reply, or `None` while it has no
+        # reply at all. Decides which provider stages this turn could ever be
+        # the claimant for. marker:r9-reply-source
+        self.reply_source: Optional[str] = None
         # How many `tts_node` generators are still able to render for this
         # reply. A span closed while one is open publishes a duration shorter
         # than the audio the caller heard, and the frames that arrive after it
@@ -420,6 +425,8 @@ class VaaniLiveKitRecorder:
         self._turns: Dict[str, _TurnState] = {}
         self._all_turns: List[_TurnState] = []
         self._pending_turn: Optional[_TurnState] = None
+        # Streams that named their speech before that speech was registered.
+        self._unpinned_streams: Dict[str, List["_OutputStream"]] = {}
         self._current_turn: Optional[_TurnState] = None
         # The turn whose reply is being synthesized, which is *not* the same as
         # the turn being served: a caller who speaks while the agent is still
@@ -1408,8 +1415,14 @@ class VaaniLiveKitRecorder:
         speech_id = _speech_id(getattr(event, "speech_handle", None))
         if speech_id is None:
             return
+        # `source` is `"say"` or `"generate_reply"`. An unknown value is read
+        # as a generated reply, which is the conservative reading: it keeps
+        # the turn eligible to claim an LLM measurement rather than silently
+        # narrowing the field on a build whose events say something new.
+        source = getattr(event, "source", None) or "generate_reply"
         if speech_id in self._turns:
             self._turns[speech_id].speech_handle = getattr(event, "speech_handle", None)
+            self._turns[speech_id].reply_source = source
             self._current_turn = self._turns[speech_id]
             self._retire_reply(keep=self._turns[speech_id])
             self._speaking_turn = self._turns[speech_id]
@@ -1422,6 +1435,13 @@ class VaaniLiveKitRecorder:
         self._pending_turn = None
         self._turns[speech_id] = state
         state.speech_handle = getattr(event, "speech_handle", None)
+        state.reply_source = source
+        # A `tts_node` invocation can render a whole short reply and return
+        # before this event is dispatched. Its stream named this speech from
+        # the start, so nothing about it was ever ambiguous -- it was only
+        # waiting for the turn to exist. marker:r9-resolve-deferred
+        for deferred in self._unpinned_streams.pop(speech_id, []):
+            self._pin_stream(deferred, state)
         self._current_turn = state
         # A new reply supersedes the previous one, so whatever was still
         # draining has now stopped: this is the point at which the last reply's
@@ -1471,8 +1491,24 @@ class VaaniLiveKitRecorder:
             # LLM round-trip before it yields anything, and until its stream is
             # counted the turn looks idle -- so the next `speech_created`
             # retires and closes a reply that is still about to speak.
-            self._pin_stream(stream, self._turns.get(stream.speech_id))
+            if self._pin_stream(stream, self._turns.get(stream.speech_id)) is None:
+                self._defer_stream(stream)
         return stream
+
+    def _defer_stream(self, stream: "_OutputStream") -> None:
+        """Hold a stream until the speech it named is registered.
+
+        Waiting is not the same as losing. Whatever the stream buffers in this
+        window is provably owned -- it carries the speech id -- so the only
+        question is when the turn appears, and until this existed the answer
+        was "when the next frame arrives", which for a reply that has already
+        finished rendering is never. marker:r9-defer
+        """
+        if stream.speech_id is None:
+            return
+        waiting = self._unpinned_streams.setdefault(stream.speech_id, [])
+        if stream not in waiting:
+            waiting.append(stream)
 
     def _pin_stream(self, stream: "_OutputStream",
                     owner: "Optional[_TurnState]") -> "Optional[_TurnState]":
@@ -1524,7 +1560,10 @@ class VaaniLiveKitRecorder:
         if stream.speech_id is not None:
             # Identity, not timing. `None` here means the turn has not been
             # registered yet, which is a wait -- never a licence to guess.
-            return self._pin_stream(stream, self._turns.get(stream.speech_id))
+            owner = self._pin_stream(stream, self._turns.get(stream.speech_id))
+            if owner is None:
+                self._defer_stream(stream)
+            return owner
         # A stream that opened before any turn existed and had no handle to
         # name: attach it as soon as a turn appears.
         return self._pin_stream(stream, self._rendering_turn())
@@ -2551,6 +2590,35 @@ class VaaniLiveKitRecorder:
         self._current_turn = state
         return state
 
+    def _could_emit(self, state: "_TurnState", stage: str) -> bool:
+        """Whether this turn could be the source of a `stage` measurement.
+
+        Two exclusions, both provable from LiveKit's own events rather than
+        from timing -- which is the whole point, since timing is exactly what
+        this code refuses to rely on:
+
+        * A turn with no `reply_source` never had a speech created for it, so
+          `tts_node` never ran and no LLM ever answered on its behalf. A
+          second final transcript arriving before the reply produces such a
+          turn, and it can never be retired, because retirement follows the
+          *speaking* turn and this one never speaks. Left in the running it
+          became a permanent second live candidate, and one duplicated
+          endpoint stopped the call from accepting another provider metric
+          for the rest of its life.
+        * `session.say()` speaks text it was handed. No LLM runs for it, so it
+          cannot be the claimant for an LLM measurement -- yet the opening
+          greeting is retired by the very speech that creates the first real
+          reply, so its `finished_at_seq` always lands at-or-after that
+          reply's and it out-argued every unnamed LLM metric on the most
+          common shape a LiveKit agent has.
+
+        It still counts as a TTS claimant: it does speak, and a late metric
+        from its synthesis is genuinely ambiguous with the next reply's.
+        """
+        if state.reply_source is None:
+            return False
+        return not (stage == "llm" and state.reply_source == "say")
+
     def _unidentified_metric_turn(self, stage: str) -> "Optional[_TurnState]":
         """Where a provider metric with no reply identity may be published.
 
@@ -2582,12 +2650,18 @@ class VaaniLiveKitRecorder:
         """
         if stage not in _REPLY_SCOPED_STAGES:
             return self._current_turn
-        live = [s for s in self._all_turns if not s.finished]
+        # Only turns that could have produced this stage are in the running --
+        # as claimants and, just as importantly, as rivals. A turn that cannot
+        # emit the measurement is not evidence of ambiguity, and counting it
+        # as one refuses metrics that were never in doubt.
+        claimants = [s for s in self._all_turns
+                     if self._could_emit(s, stage)]  # marker:r9-eligible
+        live = [s for s in claimants if not s.finished]
         candidate = live[0] if len(live) == 1 else None
         if candidate is not None and any(
                 t is not candidate and t.finished
                 and t.finished_at_seq >= candidate.seq
-                for t in self._all_turns):  # marker:r8-no-tolerance
+                for t in claimants):  # marker:r8-no-tolerance
             # A reply ended at or after this one started, so a metric arriving
             # now is at least as likely to be its trailing measurement as this
             # turn's. There is no unambiguous answer -- only a coin flip that

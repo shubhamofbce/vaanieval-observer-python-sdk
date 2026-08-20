@@ -2377,6 +2377,65 @@ async def test_a_short_shared_opening_never_decides_which_reply_owns_a_message(
         "turn-1 was interrupted after 'Sure,' -- the longer reply is not its "
         f"transcript: {turn_one_text!r}"
     )
+    turn_two_text = (spans["turn-2"].get("response") or {}).get("text") or ""
+    assert "one moment" in turn_two_text, (
+        "the reply that taped these exact words must keep them; dropping the "
+        "transcript because a short shared opening also matched is the same "
+        f"defect pointed the other way: {turn_two_text!r}"
+    )
+    # Only one reply's tape matches the item, so ownership *is* decidable and
+    # the call must not be marked ambiguous. Declaring a gap here would make a
+    # healthy call look lossy -- the cost of resolving the tie by refusing to.
+    gaps = _manifest_of(rec)["capture_status"].get("coverage_gaps") or []
+    assert not any("attribut" in str(g) for g in gaps), (
+        f"exactly one reply spoke these words; that is not undecidable: {gaps}"
+    )
+
+
+async def test_a_short_interrupted_tape_never_claims_a_longer_reply(recorder,
+                                                                    monkeypatch):
+    """The competitor check saves the case where both replies have taped text.
+    It cannot save this one: the new reply has rendered nothing yet, so the
+    interrupted tape `"Sure,"` is the *only* match for `"Sure, one moment"` and
+    a bare prefix rule hands it a confident wrong answer. Replies routinely
+    open with the same few words, and an interrupted tape is routinely that
+    short, so a prefix is only evidence when it is long enough to identify a
+    reply."""
+    from vaani_observer.integrations import livekit as lk
+
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_input_transcribed", transcript("hello", True))
+    # No chat_items anywhere, so the negative-proof rung cannot decide.
+    h1 = SimpleNamespace(id="s1")
+    session.emit("speech_created", speech_created(h1))
+    monkeypatch.setattr(lk, "_current_speech_handle", lambda: h1)
+    first = rec.open_output_stream()
+    rec.tap_output_text("Sure,", first)          # interrupted after two words
+    rec.tap_output_frame(agent_frame(600), first)
+    h2 = SimpleNamespace(id="s2")
+    session.emit("speech_created", speech_created(h2, source="say"))
+    monkeypatch.setattr(lk, "_current_speech_handle", lambda: h2)
+    second = rec.open_output_stream()
+    # The second reply has rendered nothing yet -- no text and no audio -- so
+    # it is the only other candidate and it cannot compete on text. The item
+    # must arrive in this window, because once the new reply has audio the
+    # attribution is no longer in question.
+    session.emit("conversation_item_added", chat_item("assistant", "Sure, one moment"))
+    rec.tap_output_frame(agent_frame(700), second)
+    await rec.finish()
+
+    spans = {o["turn_id"]: o for o in _all_of_type(rec, "tts")}
+    turn_one_text = (spans["turn-1"].get("response") or {}).get("text") or ""
+    assert "one moment" not in turn_one_text, (
+        "turn-1 was interrupted after 'Sure,' -- a five-character opening is "
+        f"not proof that the longer reply is its transcript: {turn_one_text!r}"
+    )
+    gaps = _manifest_of(rec)["capture_status"].get("coverage_gaps") or []
+    assert any("attribut" in str(g) for g in gaps), (
+        f"an undecidable transcript must be declared, not silently dropped: {gaps}"
+    )
 
 
 async def test_drain_frames_landing_on_a_published_span_are_written_off_not_reported_lost(

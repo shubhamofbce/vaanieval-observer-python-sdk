@@ -2408,6 +2408,198 @@ async def test_drain_frames_landing_on_a_published_span_are_written_off_not_repo
     )
 
 
+async def test_a_reply_is_not_retired_while_its_generator_waits_on_the_llm(
+        recorder, monkeypatch):
+    """The stream was counted against its turn on first *output*, not on
+    invocation. `tts_node` is entered a full LLM round-trip before it yields,
+    so for that entire window the reply looked idle: the next `speech_created`
+    retired it and closed its span, and everything it went on to say was
+    published against the wrong reply -- or against a span that was already
+    ended and could take no more."""
+    from vaani_observer.integrations import livekit as lk
+
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_input_transcribed", transcript("hello", True))
+    h1 = FakeSpeechHandle("s1")
+    session.emit("speech_created", speech_created(h1))
+    monkeypatch.setattr(lk, "_current_speech_handle", lambda: h1)
+    first = rec.open_output_stream()  # invoked; the LLM has not answered yet
+
+    turn_one = rec._turns["s1"]
+    assert turn_one.open_streams == 1, (
+        "the stream must be counted at invocation, or the reply looks idle "
+        "for the whole LLM round-trip"
+    )
+    h2 = FakeSpeechHandle("s2")
+    session.emit("speech_created", speech_created(h2, source="say"))
+    assert turn_one.finished is False, (
+        "a reply whose generator is still running was retired by the next "
+        "speech, so its remaining audio had nowhere to go"
+    )
+    rec.tap_output_text("the real answer", first)
+    rec.tap_output_frame(agent_frame(3000), first)
+    rec.close_output_stream(first)
+    await rec.finish()
+
+    spans = {o["turn_id"]: o for o in _all_of_type(rec, "tts")}
+    assert (spans["turn-1"].get("response") or {}).get("played_ms") == 3000, spans
+
+
+async def test_the_timing_fallback_also_holds_its_reply_open(recorder, monkeypatch):
+    """The deferral was wired only into the identity path. On a livekit-agents
+    build that hides the speech context the stream was attached directly and
+    never counted, so close-deferral -- the fix for the defect above -- was
+    silently inactive on exactly the versions that need it most."""
+    from vaani_observer.integrations import livekit as lk
+
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_input_transcribed", transcript("hello", True))
+    monkeypatch.setattr(lk, "_current_speech_handle", lambda: None)
+    session.emit("speech_created", speech_created(FakeSpeechHandle("s1")))
+    stream = rec.open_output_stream()
+
+    turn_one = rec._turns["s1"]
+    assert turn_one.open_streams == 1, "the fallback path must count its stream too"
+    session.emit("speech_created", speech_created(FakeSpeechHandle("s2")))
+    assert turn_one.finished is False
+    rec.tap_output_frame(agent_frame(1200), stream)
+    rec.close_output_stream(stream)
+    await rec.finish()
+
+    measured = _manifest_of(rec)["capture_status"]["measured"]
+    assert measured["stream_ownership"] == "inferred", (
+        "a call whose attribution rests on timing must say so; a reader "
+        f"cannot otherwise tell it from one that was proved: {measured}"
+    )
+
+
+async def test_a_call_whose_streams_were_all_identified_says_so(recorder, monkeypatch):
+    """The provenance field is only worth publishing if it can be `proved`."""
+    from vaani_observer.integrations import livekit as lk
+
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    h1 = FakeSpeechHandle("s1")
+    monkeypatch.setattr(lk, "_current_speech_handle", lambda: h1)
+    session.emit("user_input_transcribed", transcript("hello", True))
+    session.emit("speech_created", speech_created(h1))
+    stream = rec.open_output_stream()
+    rec.tap_output_text("an answer of a reasonable length", stream)
+    rec.tap_output_frame(agent_frame(1000), stream)
+    rec.close_output_stream(stream)
+    session.emit("metrics_collected", tts_metrics("s1"))
+    await rec.finish()
+
+    measured = _manifest_of(rec)["capture_status"]["measured"]
+    assert measured["stream_ownership"] == "proved", measured
+
+
+async def test_an_ordinary_sequential_call_still_places_unidentified_metrics(recorder):
+    """Refusing every metric that cannot name its reply is the safe reading,
+    and it is also wrong: on a plugin that never sets `speech_id` the previous
+    reply always finishes as the next one opens, so a blanket rule would drop
+    *every* metric on a healthy call -- reintroducing the audit's P0-A by
+    caution instead of by bug. A reply that already received its own metric is
+    not waiting for another, which is what makes this case unambiguous."""
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_input_transcribed", transcript("one", True))
+    session.emit("speech_created", speech_created(FakeSpeechHandle("s1")))
+    rec.tap_output_frame(agent_frame(1000))
+    session.emit("metrics_collected", tts_metrics(None))
+    session.emit("conversation_item_added", chat_item("assistant", "the first answer"))
+    session.emit("user_input_transcribed", transcript("two", True))
+    session.emit("speech_created", speech_created(FakeSpeechHandle("s2")))
+    rec.tap_output_frame(agent_frame(1000))
+    session.emit("metrics_collected", tts_metrics(None, ttfb=0.4))
+    session.emit("conversation_item_added", chat_item("assistant", "the second answer"))
+    await rec.finish()
+
+    spans = {o["turn_id"]: o for o in _all_of_type(rec, "tts")}
+    assert len(spans) == 2, spans
+    for turn_id, span in spans.items():
+        assert (span.get("response") or {}).get("characters_count") is not None, (
+            f"{turn_id} lost its provider measurement to an over-strict rule: {span}"
+        )
+    gaps = _manifest_of(rec)["capture_status"].get("coverage_gaps") or []
+    assert not any("speech_id" in str(g) for g in gaps), gaps
+
+
+async def test_a_dropped_metric_reports_the_stage_it_came_from(recorder, monkeypatch):
+    """Every dropped metric was reported as a `tts` gap, whatever it was. An
+    operator reading "tts metrics were dropped" goes looking for missing audio;
+    the LLM timings that actually went missing are not where they look."""
+    from vaani_observer.integrations import livekit as lk
+
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_input_transcribed", transcript("hello", True))
+    h1 = FakeSpeechHandle("s1")
+    session.emit("speech_created", speech_created(h1))
+    monkeypatch.setattr(lk, "_current_speech_handle", lambda: h1)
+    first = rec.open_output_stream()
+    rec.tap_output_text("the long answer", first)
+    rec.tap_output_frame(agent_frame(2000), first)
+    h2 = FakeSpeechHandle("s2")
+    session.emit("speech_created", speech_created(h2))
+    monkeypatch.setattr(lk, "_current_speech_handle", lambda: h2)
+    second = rec.open_output_stream()
+    rec.tap_output_frame(agent_frame(500), second)
+    session.emit("metrics_collected", llm_metrics(None))
+    await rec.finish()
+
+    gaps = _manifest_of(rec)["capture_status"].get("coverage_gaps") or []
+    assert any(g.get("stage") == "llm" and "speech_id" in str(g) for g in gaps), (
+        f"the gap must name the stage whose measurement was lost: {gaps}"
+    )
+
+
+async def test_audio_on_an_identified_stream_is_never_written_off_as_jitter(recorder,
+                                                                           monkeypatch):
+    """The write-off exists for frames whose owner was guessed from timing at a
+    turn boundary. Applying it to a stream that *names* its reply turns the
+    allowance into a blindfold: a lifecycle bug that strands part of a
+    tokenized reply is precisely what it would hide, and hiding it is how a
+    100% undercount ends up behind a green checkmark."""
+    from vaani_observer.integrations import livekit as lk
+
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_input_transcribed", transcript("hello", True))
+    h1 = FakeSpeechHandle("s1")
+    session.emit("speech_created", speech_created(h1))
+    monkeypatch.setattr(lk, "_current_speech_handle", lambda: h1)
+    stream = rec.open_output_stream()
+    rec.tap_output_text("a first answer of a reasonable length", stream)
+    rec.tap_output_frame(agent_frame(2000), stream)
+    session.emit("metrics_collected", tts_metrics("s1"))
+    rec.close_output_stream(stream)
+    session.emit("conversation_item_added",
+                 chat_item("assistant", "a first answer of a reasonable length"))
+    # The next reply starts, so the first one's span is published and closed.
+    session.emit("speech_created", speech_created(FakeSpeechHandle("s2")))
+    # More frames now arrive on the very same stream: they name their reply, so
+    # this is a lifecycle defect and not the boundary jitter the allowance was
+    # written for.
+    rec.tap_output_frame(agent_frame(120), stream)
+    await rec.finish()
+
+    measured = _manifest_of(rec)["capture_status"]["measured"]
+    assert measured["tail_written_off_ms"] == 0, (
+        "audio on a stream that named its reply is not boundary jitter: "
+        f"{measured}"
+    )
+    assert measured["unattributed_agent_audio_ms"] >= 120, measured
+
+
 async def test_a_recorder_that_measured_nothing_is_never_called_fully_captured(recorder):
     """With no audio tap, "every millisecond we taped is on a span" is
     trivially true because nothing was taped. Gating that check on whether an

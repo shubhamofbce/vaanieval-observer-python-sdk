@@ -266,7 +266,7 @@ class _TurnState:
                  "tts_response", "tts_ended_at", "tools", "audio_bytes",
                  "audio_first_at_ms", "finished", "tts_derived", "tts_ttfa_ms",
                  "reply_complete", "tts_text", "tts_reconstructed", "speech_handle",
-                 "reply_source", "reply_attribution",
+                 "reply_source", "reply_attribution", "awaiting_tool_reply",
                  "filler_speech_id", "recorded_item_ids",
                  "open_streams", "awaiting_stream_close", "unscoped_audio_bytes",
                 "unscoped_audio_bytes_at_publish", "publication_snapshot_taken",
@@ -344,6 +344,11 @@ class _TurnState:
         # metric exists, and the caveat has to reach the expensive number
         # either way.
         self.reply_attribution: Optional[Dict[str, Any]] = None
+        # Set once this turn has run a tool, because a realtime model answers a
+        # tool result with a generation indistinguishable from one prompted by
+        # new speech. Cleared when a reply is bound, so only the answer actually
+        # owed to the tool is read this way.
+        self.awaiting_tool_reply = False
         # How many `tts_node` generators are still able to render for this
         # reply. A span closed while one is open publishes a duration shorter
         # than the audio the caller heard, and the frames that arrive after it
@@ -433,29 +438,36 @@ def _set_metering_scope(response: Dict[str, Any]) -> None:
     )
 
 
-def _reply_origin(event: Any, handle: Any) -> str:
+def _reply_origin(event: Any, handle: Any, *, application_call: bool,
+                  tool_reply_pending: bool) -> str:
     """Say which caller a reply was created for, or admit that it is unknown.
 
-    `scheduled` alone is queue state, not provenance. Three code paths build a
-    `SpeechCreatedEvent` with `source="generate_reply"`, and only one of them is
-    the answer to the user turn that just completed:
+    `scheduled` alone is queue state, not provenance, and neither is any single
+    field on the event. Three code paths build a `SpeechCreatedEvent` with
+    `source="generate_reply"`:
 
-    * the automatic reply to a completed turn is scheduled at once, reports
-      `user_initiated=True` and carries audio input details
-      (`agent_activity.py:2574` on 1.7.0, `:2553` on 1.6.10);
-    * preemptive generation passes `schedule_speech=False` and stays unscheduled
-      until its predicted turn is validated (`:2321` / `:2303`);
-    * a realtime model's server-side generation is scheduled immediately but
-      reports `user_initiated=False` (`:2007` / `:1983`). It answers the speech
-      being transcribed *now* -- the framework even notes the final transcript
-      may arrive after the reply it prompted -- so it belongs with that speech,
-      exactly like a preemptive one.
+    * `_generate_reply`, with `user_initiated=True`. Reached both by LiveKit's
+      automatic answer to a completed user turn (`agent_activity.py:2574` on
+      1.7.0, `:2553` on 1.6.10, scheduled at once) and by preemptive generation
+      (`:2321` / `:2303`, `schedule_speech=False`, and so unscheduled until its
+      predicted turn is validated);
+    * that same function reached from the public
+      `AgentSession.generate_reply()`, which is why `application_call` has to be
+      observed at the call rather than read off the event. Its `input_modality`
+      argument is passed through unchanged (`agent_session.py:1516`), so a
+      caller passing `"audio"` produces an event identical in every field to the
+      automatic answer;
+    * a realtime model's server-side generation (`:2007` / `:1983`), scheduled
+      at once with `user_initiated=False`.
 
-    `AgentSession.generate_reply()` is the case that stays unknown. It is
-    scheduled and `user_initiated=True` like the automatic reply, and only its
-    input modality differs, defaulting to `"text"`. An application may call it to
-    answer the caller or to say something unrelated, and nothing in the event
-    distinguishes those, so the turn says so rather than picking one.
+    That last one has two causes LiveKit does not separate. It is emitted both
+    for a reply to the speech being transcribed now -- the framework notes the
+    final transcript may arrive after the reply it prompted -- and for the
+    automatic reply after a tool result, which answers the turn that ran the
+    tool. `_on_generation_created` builds the identical handle for both and only
+    then consumes its private pending-tool marker (`:2020-2025`). So the answer
+    depends on whether a tool result on the carried turn is still owed a reply,
+    and where that is true the placement is disclosed rather than asserted.
     """
     scheduled = getattr(handle, "scheduled", None)
     if scheduled is None:
@@ -466,9 +478,8 @@ def _reply_origin(event: Any, handle: Any) -> str:
     if user_initiated is None:
         return "unknown"
     if not user_initiated:
-        return "in_flight_speech"
-    modality = getattr(getattr(handle, "input_details", None), "modality", None)
-    if modality != "audio":
+        return "tool_reply" if tool_reply_pending else "in_flight_speech"
+    if application_call:
         return "unknown"
     return "completed_turn"
 
@@ -616,6 +627,16 @@ class VaaniLiveKitRecorder:
         self._stt_identity: Dict[str, Any] = {}
         self._outcome: Optional[str] = None
         self._turn_counter = 0
+        # Non-zero while the application's own `generate_reply()` is running.
+        # A reply it asks for is indistinguishable on the wire from LiveKit's
+        # automatic answer -- `input_modality` is passed straight through, so
+        # even the modality matches -- and the only place the difference exists
+        # is the call itself. Counted rather than flagged because a tool may
+        # call it while another call is in progress.
+        self._application_reply_depth = 0
+        # (session, attribute, original) for methods wrapped to observe that,
+        # so attaching twice or detaching leaves the session as it was found.
+        self._patched: List[tuple] = []
         self._sockets: List[Any] = []
         # (session, event name, wrapped handler). The *wrapped* reference has to
         # be kept or `session.off()` is impossible: LiveKit matches listeners by
@@ -804,8 +825,48 @@ class VaaniLiveKitRecorder:
                 )
                 continue
             self._attached.append((session, name, wrapped))
+        self._watch_application_replies(session)
         self._sniff_models(session)
         return self
+
+    def _watch_application_replies(self, session: Any) -> None:
+        """Notice when the application asks for a reply itself.
+
+        `AgentSession.generate_reply()` reaches the same `_generate_reply` as
+        LiveKit's automatic answer to a completed turn, emits `speech_created`
+        synchronously inside the call (`agent_session.py:1508-1520`), and passes
+        `input_modality` through unchanged -- so an application passing
+        `"audio"` produces an event identical in every field to the automatic
+        one. The two are only distinguishable from the call, and the difference
+        decides whether a reply may be merged into the turn a filler is holding
+        open. Wrapping is confined to counting the call: the original is invoked
+        with the arguments it was given and its result returned untouched.
+        """
+        original = getattr(session, "generate_reply", None)
+        if not callable(original) or getattr(original, "_vaani_wrapped", False):
+            return
+
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            self._application_reply_depth += 1
+            try:
+                return original(*args, **kwargs)
+            finally:
+                self._application_reply_depth -= 1
+
+        wrapper._vaani_wrapped = True  # type: ignore[attr-defined]
+        try:
+            had_own = "generate_reply" in vars(session)
+            session.generate_reply = wrapper
+        except Exception as error:  # noqa: BLE001 - version drift is survivable
+            # Losing this only costs the distinction, and the reply then reads
+            # as unproven rather than as the automatic answer.
+            self._warn_once(
+                "watch:generate_reply",
+                "cannot observe generate_reply (%s); replies arriving over a "
+                "filler will be reported as inferred", error,
+            )
+            return
+        self._patched.append((session, "generate_reply", original if had_own else None))
 
     def _sniff_models(self, session: Any) -> None:
         """Learn each stage's real model from the plugin instance.
@@ -853,6 +914,15 @@ class VaaniLiveKitRecorder:
             except Exception as error:  # noqa: BLE001 - teardown must not raise
                 logger.debug("vaani: cannot unsubscribe from %r (%s)", name, error)
         self._attached.clear()
+        for session, attribute, original in self._patched:
+            try:
+                if original is None:
+                    delattr(session, attribute)
+                else:
+                    setattr(session, attribute, original)
+            except Exception as error:  # noqa: BLE001 - teardown must not raise
+                logger.debug("vaani: cannot restore %r (%s)", attribute, error)
+        self._patched.clear()
 
     async def finish(self, outcome: Optional[str] = None,
                      timeout: Optional[float] = None) -> None:
@@ -1999,6 +2069,9 @@ class VaaniLiveKitRecorder:
         a second copy of it that drifts.
         """
         self._pending_turn = None
+        # Whatever this reply turns out to be, the tool result is no longer
+        # waiting on one, so a later generation is not read as its answer.
+        state.awaiting_tool_reply = False
         if contested:
             # Held on the turn rather than written straight into
             # `tts_response`: a reply can report LLM tokens and then be
@@ -2089,9 +2162,17 @@ class VaaniLiveKitRecorder:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return False
+        # Read now, not at settlement: both are true only for the duration of
+        # this handler. `generate_reply()` has returned by the next loop slice,
+        # and a tool result is owed a reply only until one is bound.
+        application_call = self._application_reply_depth > 0
+        tool_reply_pending = bool(getattr(carry, "awaiting_tool_reply", False))
         settle = _guard(
             self, "speech_created:contested",
-            lambda evt: self._settle_contested_reply(evt, speech_id, source, carry),
+            lambda evt: self._settle_contested_reply(
+                evt, speech_id, source, carry,
+                application_call=application_call,
+                tool_reply_pending=tool_reply_pending),
         )
         self._contested_events[speech_id] = event
         try:
@@ -2117,7 +2198,8 @@ class VaaniLiveKitRecorder:
             settle(self._contested_events.pop(speech_id, None))
 
     def _settle_contested_reply(self, event: Any, speech_id: str, source: str,
-                                carry: "_TurnState") -> None:
+                                carry: "_TurnState", *, application_call: bool,
+                                tool_reply_pending: bool) -> None:
         """Bind a deferred reply now that its handle has been read.
 
         Scheduled means LiveKit created this reply because the caller's turn
@@ -2134,7 +2216,8 @@ class VaaniLiveKitRecorder:
             # chose stands; a second binding here would move the turn under it.
             return
         handle = getattr(event, "speech_handle", None)
-        origin = _reply_origin(event, handle)
+        origin = _reply_origin(event, handle, application_call=application_call,
+                               tool_reply_pending=tool_reply_pending)
         if origin == "completed_turn":
             if _is_unanswered_turn(carry, allow_filler=True):
                 self._bind_reply(carry, event, speech_id, source, contested=False)
@@ -2143,6 +2226,12 @@ class VaaniLiveKitRecorder:
             # new exchange, not a contested one.
             self._bind_reply(self._new_turn(), event, speech_id, source,
                              contested=False)
+            return
+        if origin == "tool_reply":
+            # The turn that ran the tool is owed this answer, and that is the
+            # likely reading -- but a caller talking over the tool call could
+            # also have prompted it, and the event is the same either way.
+            self._bind_reply(carry, event, speech_id, source, contested=True)
             return
         if origin == "in_flight_speech":
             # Generated for the speech still arriving, whose final transcript
@@ -3321,6 +3410,7 @@ class VaaniLiveKitRecorder:
         state = self._current_turn
         if state is None:
             return
+        state.awaiting_tool_reply = True
         try:
             pairs = event.zipped()
         except Exception:  # noqa: BLE001 - version drift is survivable

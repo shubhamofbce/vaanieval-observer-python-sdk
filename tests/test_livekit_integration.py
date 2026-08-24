@@ -40,6 +40,18 @@ class FakeAgentSession:
         for handler in self.handlers.get(name, []):
             handler(event)
 
+    def generate_reply(self, *, input_modality: str = "text",
+                       handle_id: str = "app-reply"):
+        """What `AgentSession.generate_reply()` does that the recorder can see.
+
+        The event is emitted synchronously inside the call and the handle is
+        returned, and `input_modality` is passed through unchanged -- so with
+        `"audio"` every field matches LiveKit's own automatic answer.
+        """
+        handle = FakeSpeechHandle(handle_id, modality=input_modality)
+        self.emit("speech_created", speech_created(handle))
+        return handle
+
 
 class FakeFrame:
     """An `rtc.AudioFrame` stand-in."""
@@ -4121,14 +4133,13 @@ async def test_a_finished_filler_turn_does_not_adopt_the_next_callers_reply(reco
 async def test_a_reply_the_application_asked_for_admits_it_might_answer_the_caller(recorder):
     """The one thing this must never be is silent.
 
-    Three of the four ways a reply is created say who they are for: the
-    automatic answer to a completed turn is scheduled, `user_initiated` and
-    audio-modality; a preemptive generation is unscheduled; a realtime model's
-    server-side generation is not `user_initiated`. The fourth --
-    `AgentSession.generate_reply()` -- is scheduled and `user_initiated` like
-    the automatic answer, and differs only in defaulting to text modality. An
-    application may call it to answer the caller, or to say something unrelated,
-    and nothing in the event tells them apart.
+    `AgentSession.generate_reply()` reaches the same `_generate_reply` as
+    LiveKit's automatic answer and passes `input_modality` straight through, so
+    an application asking for audio produces an event identical in every field:
+    scheduled, `user_initiated`, audio input details. Reading the event alone
+    cannot separate them, and an application may call it to answer the caller or
+    to say something unrelated. The recorder notices the call instead -- but
+    noticing that it happened is not the same as knowing what it meant.
 
     The recorder keeps such a reply separate, because merging two exchanges
     makes a caller's words appear answered before they were spoken. But that is
@@ -4148,8 +4159,9 @@ async def test_a_reply_the_application_asked_for_admits_it_might_answer_the_call
     # reply of its own. Nothing here says which of the two it is for.
     session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
     session.emit("user_input_transcribed", transcript("And to Boston?", False))
-    session.emit("speech_created",
-                 speech_created(FakeSpeechHandle("answer-2", modality="text")))
+    # Asking for audio input details, which makes the event identical in every
+    # field to the automatic answer. Only the call itself is different.
+    session.generate_reply(input_modality="audio", handle_id="answer-2")
     session.emit("metrics_collected", tts_metrics("answer-2", audio_duration=2.0))
     rec.tap_output_frame(agent_frame(2000))
     await rec.finish()
@@ -4347,6 +4359,66 @@ async def test_a_realtime_models_own_reply_is_not_merged_into_the_previous_calle
     assert llm["response"].get("reply_attribution") is None, (
         "the event said this reply was not user-initiated, so placing it is a "
         "reading rather than a judgement and must not be hedged"
+    )
+
+
+def tools_executed(name: str = "search_flights") -> Any:
+    call = SimpleNamespace(name=name, arguments='{"to":"GOI"}', call_id="c1")
+    output = SimpleNamespace(output='{"price":6000}', is_error=False, call_id="c1")
+    return SimpleNamespace(function_calls=[call], function_call_outputs=[output],
+                           zipped=lambda: [(call, output)])
+
+
+@pytest.mark.asyncio
+async def test_a_realtime_reply_owed_to_a_tool_result_is_not_given_to_the_next_caller(
+        recorder):
+    """`user_initiated=False` has two causes, and they point opposite ways.
+
+    LiveKit emits the identical scheduled, audio, not-user-initiated event both
+    for a realtime model answering the speech being transcribed now and for its
+    automatic reply after a tool result -- which answers the turn that ran the
+    tool. `_on_generation_created` builds the same handle for both and only then
+    consumes its private pending-tool marker, so the event cannot be read.
+
+    Treating every such reply as generated for the speech in flight hands the
+    tool's tokens and response latency to whoever spoke over it, and leaves the
+    turn that called the tool with no answer. What the recorder can see is that
+    a tool result on this turn is still owed a reply, so the reply stays with
+    it -- and says that the placement was a reading, because a caller talking
+    over the tool call could have prompted it instead.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    rec.note_audio_tap_installed()
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("book the flight", True))
+    session.emit("conversation_item_added", chat_item("user", "book the flight"))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("filler"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    session.emit("function_tools_executed", tools_executed())
+    # Someone speaks over the tool call, and the model's post-tool reply lands.
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("actually wait", False))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("tool-answer"),
+                                user_initiated=False))
+    session.emit("metrics_collected", llm_metrics("tool-answer"))
+    await rec.finish()
+
+    ops = operations(read_events(_dir(rec)))
+    asked = next(op for op in ops if op["type"] == "stt"
+                 and "book the flight" in (op["response"].get("transcript") or ""))
+    llm = next(op for op in ops if op["type"] == "llm")
+    assert llm["turn_id"] == asked["turn_id"], (
+        "the answer owed to this turn's tool result was handed to whoever "
+        "spoke over it, leaving the turn that called the tool unanswered"
+    )
+    assert llm["response"].get("reply_attribution") == "inferred", (
+        "a caller talking over the tool call could have prompted this reply "
+        "instead, and the event says nothing either way"
     )
 
 

@@ -8,6 +8,7 @@ contract without pulling a heavyweight optional dependency into the suite.
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 import pathlib
 import time
@@ -4312,7 +4313,7 @@ async def test_a_contested_turns_token_count_carries_the_caveat_with_no_tts_span
 
 @pytest.mark.asyncio
 async def test_an_ordinary_interim_does_not_detach_the_answer_from_its_question(
-        recorder):
+        recorder, public_generate_reply):
     """A reply LiveKit scheduled answers the turn it was scheduled for.
 
     A preflight transcript and an ordinary interim arrive as the same public
@@ -4327,6 +4328,13 @@ async def test_an_ordinary_interim_does_not_detach_the_answer_from_its_question(
     decision only has to wait until this handler returns. It is deliberately
     read here *before* the loop gets a slice -- the LLM metric is emitted
     immediately -- because the answer must not depend on which arrives first.
+
+    The reply is emitted the way LiveKit emits it -- from inside
+    `AgentActivity._generate_reply()` -- because that frame is what says the
+    answer was LiveKit's own. Emitting it from the test's own frame models a
+    shape LiveKit never produces and is indistinguishable from a session this
+    SDK has never heard of generating a reply by itself, which is not
+    something that can be merged into anyone's turn.
     """
     rec = recorder()
     session = FakeAgentSession()
@@ -4343,7 +4351,8 @@ async def test_an_ordinary_interim_does_not_detach_the_answer_from_its_question(
     session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
     session.emit("user_input_transcribed", transcript("um", False))
     # Caller one's own answer, scheduled the moment it was created.
-    session.emit("speech_created", speech_created(FakeSpeechHandle("old-answer")))
+    public_generate_reply.reach_emitter(
+        session, "old-answer", _from=public_generate_reply.livekit_file)
     session.emit("metrics_collected", llm_metrics("old-answer"))
     await rec.finish()
 
@@ -6202,4 +6211,290 @@ async def test_a_post_tool_reply_caveat_describes_the_route_it_took(recorder):
     )
     assert "most likely an application call" not in reason, (
         "the caveat describes a different route and the opposite placement"
+    )
+
+
+def _traced(method):
+    """Wrap a method the way a tracing layer does.
+
+    The frame this leaves is named for the decorator, not for what it wraps,
+    and it never delegates -- which is the shape that defeated a name-based
+    read of the call site.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, handle_id="reply-1", **kwargs):
+        self.emit("speech_created", speech_created(FakeSpeechHandle(handle_id)))
+
+    return wrapper
+
+
+def _ask_and_wait(session, handle_id="reply-1"):
+    """Drive one contested reply on a compatible session and settle it."""
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("What is the fare?", True))
+    session.emit("conversation_item_added", chat_item("user", "What is the fare?"))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("filler-1"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("And to Boston?", False))
+
+
+@pytest.mark.asyncio
+async def test_a_decorated_compatible_session_is_not_read_as_livekits_answer(
+        recorder):
+    """Two safe fallbacks that compose back into the unsafe one.
+
+    Neither guard alone was wrong. Without `livekit.agents` the reply is read
+    from the session's own `generate_reply` frame; with it, an absent emitting
+    frame rules the automatic answer out. But the second guard was disabled
+    whenever the first applied, so a compatible session whose method is *also*
+    decorated matched neither -- `functools.wraps` copies the name, so the
+    frame is called `wrapper` -- and fell through to the reading that merges
+    the reply backwards into the previous caller's turn, unflagged.
+
+    With no LiveKit in the process there is no automatic answer for a reply to
+    be, so failing to prove the application called it cannot prove that LiveKit
+    did.
+    """
+    class Decorated(FakeAgentSession):
+        """The override emits the reply itself, as a tracing layer would.
+
+        `functools.wraps` copies `__name__` but not the code object, so the
+        only frame this leaves is called `wrapper` -- the name-based read
+        cannot see it, and delegating to the wrapped method would hide the
+        defect by putting a `generate_reply` frame back on the stack.
+        """
+
+        generate_reply = _traced(FakeAgentSession.generate_reply)
+
+    rec = recorder()
+    session = Decorated()
+    assert session.generate_reply.__name__ == "generate_reply", (
+        "guard: the decorator must look like the method it replaced"
+    )
+    assert session.generate_reply.__code__.co_name == "wrapper", (
+        "guard: this test is meaningless unless the frame is named for the "
+        "decorator rather than the method"
+    )
+    rec.attach(session)
+    rec.note_audio_tap_installed()
+    _ask_and_wait(session)
+    rec.tap_output_frame(agent_frame(400))
+    session.generate_reply(handle_id="wrapped-reply")
+    session.emit("metrics_collected", llm_metrics("wrapped-reply"))
+    await rec.finish()
+
+    ops = operations(read_events(_dir(rec)))
+    llm = next(op for op in ops if op["type"] == "llm")
+    asked = next(op for op in ops if op["type"] == "stt"
+                 and "fare" in (op["response"].get("transcript") or ""))
+    assert llm["response"].get("total_tokens"), (
+        "guard: this test is meaningless unless the tokens were measured"
+    )
+    assert llm["turn_id"] != asked["turn_id"], (
+        "a decorated compatible session's reply was merged into the previous "
+        "caller's turn as though LiveKit had generated it automatically"
+    )
+    assert llm["response"].get("reply_attribution") == "inferred", (
+        "a reply placed on no evidence at all must say so"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_compatible_session_with_an_unreadable_stack_is_not_merged(
+        recorder, monkeypatch):
+    """Blocked introspection is not evidence of the automatic answer either.
+
+    The no-LiveKit branch returned `None` -- which means "LiveKit generated
+    this automatically" -- when `sys._getframe` raised, on a runtime where no
+    LiveKit exists to have generated anything. The reply was merged backwards
+    with nothing recorded about it, and the caveat written for exactly this
+    case could never be reached.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    rec.note_audio_tap_installed()
+    _ask_and_wait(session)
+    rec.tap_output_frame(agent_frame(400))
+
+    real_getframe = livekit_integration.sys._getframe
+
+    def blocked(depth):
+        # Only the reply walk is blocked. Blocking every caller would break
+        # the recorder's own bookkeeping and the test would prove nothing
+        # about this route.
+        if real_getframe(1).f_code.co_name == "_reply_call_site":
+            raise RuntimeError("stack introspection is unavailable")
+        return real_getframe(depth + 1)
+
+    # Restored by hand rather than with `monkeypatch.undo()`, which would also
+    # undo what the `recorder` fixture patched.
+    livekit_integration.sys._getframe = blocked
+    try:
+        session.emit("speech_created", speech_created(FakeSpeechHandle("blind")))
+    finally:
+        livekit_integration.sys._getframe = real_getframe
+    session.emit("metrics_collected", llm_metrics("blind"))
+    await rec.finish()
+
+    ops = operations(read_events(_dir(rec)))
+    llm = next(op for op in ops if op["type"] == "llm")
+    asked = next(op for op in ops if op["type"] == "stt"
+                 and "fare" in (op["response"].get("transcript") or ""))
+    assert llm["response"].get("total_tokens"), (
+        "guard: this test is meaningless unless the tokens were measured"
+    )
+    assert llm["turn_id"] != asked["turn_id"], (
+        "a reply whose origin could not be looked at was merged into the "
+        "previous caller's turn as though it had been read"
+    )
+    assert llm["response"].get("reply_attribution") == "inferred"
+
+
+@pytest.mark.asyncio
+async def test_a_reply_from_an_earlier_attached_session_is_still_recognised(
+        recorder):
+    """`attach()` subscribes to every session and unsubscribes from none.
+
+    Only the most recently attached one was remembered, so a reply arriving
+    from a session attached earlier -- still subscribed, still this recorder's
+    to place -- had a receiver the stand-in check did not recognise, and was
+    merged into the previous caller's turn unflagged. The same mismatch appears
+    for a proxy exposing an inner session's bound method.
+    """
+    rec = recorder()
+    first = FakeAgentSession()
+    rec.attach(first)
+    rec.attach(FakeAgentSession())
+    rec.note_audio_tap_installed()
+    _ask_and_wait(first)
+    rec.tap_output_frame(agent_frame(400))
+    first.generate_reply(handle_id="earlier-reply")
+    first.emit("metrics_collected", llm_metrics("earlier-reply"))
+    await rec.finish()
+
+    ops = operations(read_events(_dir(rec)))
+    llm = next(op for op in ops if op["type"] == "llm")
+    asked = next(op for op in ops if op["type"] == "stt"
+                 and "fare" in (op["response"].get("transcript") or ""))
+    assert llm["response"].get("total_tokens"), (
+        "guard: this test is meaningless unless the tokens were measured"
+    )
+    assert llm["turn_id"] != asked["turn_id"], (
+        "a reply from a session attached earlier was merged into the previous "
+        "caller's turn because only the last attachment was remembered"
+    )
+    reason = llm["response"].get("reply_attribution_reason") or ""
+    assert "could not be read at all" not in reason, (
+        "the earlier session's own public method was on the stack and was "
+        "read -- reporting that nothing could be established sends an "
+        "operator looking for a runtime problem that does not exist"
+    )
+
+
+@pytest.mark.asyncio
+async def test_livekits_own_tool_reply_is_not_described_as_a_realtime_one(
+        recorder, public_generate_reply):
+    """Three routes settle as `tool_reply`, and they are not one story.
+
+    A realtime model generating server-side is only one of them. LiveKit's
+    asynchronous tool executor calls the public `generate_reply()` once a tool
+    finishes out of band (`voice/tool_executor.py:589-603`), producing a
+    user-initiated event through the ordinary path, and a reissue for an
+    existing run settles here too. All three were published with the realtime
+    explanation, which cites a private realtime marker that had no part in the
+    other two -- pointing an operator at a subsystem the reply never touched.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    rec.note_audio_tap_installed()
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("book it", True))
+    session.emit("conversation_item_added", chat_item("user", "book it"))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("filler-1"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    session.emit("function_tools_executed", tools_executed())
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("hello?", False))
+    public_generate_reply(session, handle_id="tool-answer")
+    session.emit("metrics_collected", llm_metrics("tool-answer"))
+    await rec.finish()
+
+    ops = operations(read_events(_dir(rec)))
+    llm = next(op for op in ops if op["type"] == "llm")
+    asked = next(op for op in ops if op["type"] == "stt"
+                 and "book it" in (op["response"].get("transcript") or ""))
+    assert llm["turn_id"] == asked["turn_id"], (
+        "guard: this test is meaningless unless the reply was merged into the "
+        "turn that ran the tool"
+    )
+    reason = llm["response"].get("reply_attribution_reason") or ""
+    assert "realtime model generated this reply server-side" not in reason, (
+        "LiveKit's own call to the public method was published as a realtime "
+        "server-side generation, which is a route it did not take"
+    )
+    assert "tool_executor" in reason and "merged into the turn" in reason, (
+        "the caveat does not name the route this reply actually took"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_realtime_generation_is_not_reported_as_an_unreadable_stack(
+        recorder, public_generate_reply):
+    """`source` alone is too broad a scope for the strict fallback.
+
+    LiveKit builds a third `speech_created` at `agent_activity.py:1991-2008`
+    for a realtime model generating server-side. It reports source
+    `generate_reply` like the automatic answer, but it is *not* user-initiated
+    and legitimately never passes through the emitting function -- so the rule
+    that reads an absent emitter as "nothing could be established" fired on a
+    completely ordinary event.
+
+    The placement is unaffected, because a reply that is not user-initiated
+    settles before the call site is consulted. The caveat is not: where a tool
+    result had already expired, the published reason told an operator that
+    stack introspection had failed and the build could not be recognised, when
+    both had worked perfectly.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    rec.note_audio_tap_installed()
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("book it", True))
+    session.emit("conversation_item_added", chat_item("user", "book it"))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("filler-1"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    session.emit("function_tools_executed", tools_executed())
+    rec._current_turn.tool_reply_deadline_ms = rec.call.now() - 1
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("hello?", False))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("realtime-answer"),
+                                user_initiated=False))
+    session.emit("metrics_collected", llm_metrics("realtime-answer"))
+    await rec.finish()
+
+    ops = operations(read_events(_dir(rec)))
+    llm = next(op for op in ops if op["type"] == "llm")
+    reason = llm["response"].get("reply_attribution_reason") or ""
+    assert reason, (
+        "guard: this test is meaningless unless a caveat was published"
+    )
+    assert "stopped waiting" in reason, (
+        "guard: the expired tool result is the fact this route turns on"
+    )
+    assert "could not be read at all" not in reason, (
+        "an ordinary realtime generation was reported as an unreadable stack"
+    )
+    assert "could not locate" not in reason, (
+        "an ordinary realtime generation was reported as an unrecognised build"
     )

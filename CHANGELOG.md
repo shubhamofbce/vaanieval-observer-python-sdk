@@ -4,6 +4,57 @@ Every recorded package stamps its SDK version into the manifest, so the version
 here is what a bug report is tied back to. Entries describe what changed about
 *the data* — a fix that alters no recorded value is not worth an adopter's time.
 
+## 0.5.6
+
+A fourteenth pass. `0.5.5` added two safe fallbacks; this release fixes the
+fact that they *composed* back into the unsafe one they replaced.
+
+**Two guards that were each correct disabled each other.** Without
+`livekit.agents` a reply is read from the recorded session's own
+`generate_reply` frame; with it, an absent emitting frame rules the automatic
+answer out. But the second guard was switched off whenever the first applied,
+so three configurations still fell through to "LiveKit generated this
+automatically" and merged the reply backwards into the previous caller's turn,
+`status: ok`, no flag:
+
+- a compatible session whose method is *also* decorated — `functools.wraps`
+  copies the name, so the frame is called `wrapper` and matches neither guard;
+- a compatible session where `sys._getframe` is blocked, so nothing could be
+  looked at;
+- a reply from a session attached *earlier*. `attach()` accepts more than one
+  session and unsubscribes from none of them, but only the most recent was
+  remembered, so an earlier session's own call had an unrecognised receiver.
+  A proxy exposing an inner session's bound method had the same mismatch.
+
+With no LiveKit in the process there is no automatic answer for a reply to be,
+so failing to prove the application called it cannot prove that LiveKit did.
+Every route that gives up now says so. The cost is a caveat on a compatible
+framework that generates replies by itself; the alternative was silence.
+
+**The strict rule was scoped too broadly.** LiveKit has a *third*
+`speech_created` site (`agent_activity.py:1991-2008`) for a realtime model
+generating server-side. It reports source `generate_reply` like the automatic
+answer but is not `user_initiated` and legitimately never passes through the
+emitting function — so an entirely ordinary event was described as an
+unreadable stack whenever a tool result had also expired. Scoped to
+`user_initiated is not False`.
+
+**One reason was published for three different routes.** `tool_reply` is
+settled not only by a realtime server-side generation but also by LiveKit's
+asynchronous tool executor calling the public method
+(`voice/tool_executor.py:589-603`) and by a reissue for an existing run. All
+three were told they were realtime, citing a private realtime marker that had
+no part in the other two. Each route now names itself.
+
+**The caveat is counted, not only recorded.** The dashboard never read
+`reply_attribution`, so the flag reached the archive and stopped there: a
+range's latency, token and cost figures could move because a reply had been
+placed by reading the call, and no panel would mention it.
+`coverage.inferred_reply_turns` now reports it for the range, and the fleet
+view says so when it is non-zero. The turn is not subtracted from the turn
+count — the exchange happened and its measurements are real; what is in doubt
+is which turn they belong to.
+
 ## 0.5.5
 
 A thirteenth pass, aimed at the fix `0.5.4` shipped. It found the mirror image

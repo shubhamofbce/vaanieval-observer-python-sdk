@@ -570,7 +570,9 @@ def _livekit_roots() -> tuple:
     return tuple(dict.fromkeys(roots))
 
 
-def _reply_call_site(source: str = "generate_reply", session: Any = None,
+def _reply_call_site(source: str = "generate_reply",
+                     sessions: Any = None,
+                     user_initiated: Any = None,
                      depth_limit: int = 60) -> Optional[str]:
     """Say whether `AgentSession.generate_reply()` is on the stack, and whose.
 
@@ -635,10 +637,18 @@ def _reply_call_site(source: str = "generate_reply", session: Any = None,
     # Returning early instead read every such call as LiveKit's automatic
     # answer and merged it into the previous caller's turn, unflagged.
     no_livekit = _GENERATE_REPLY_CODE is False
+    # A generated reply whose origin could not be read is never the automatic
+    # answer -- and with no LiveKit in the process there is no automatic answer
+    # for it to be. Every route that gives up below therefore says so instead
+    # of returning `None`, which means "LiveKit generated this automatically".
+    # `say()` is exempt throughout: it emits from a different function, so an
+    # absent anchor is expected there and a filler must still merge.
+    generated = source == "generate_reply" and user_initiated is not False
+    gave_up = _CALL_SITE_UNAVAILABLE if generated else None
     try:
         frame = sys._getframe(1)
     except Exception:  # noqa: BLE001 - no stack introspection on this runtime
-        return None if no_livekit else _CALL_SITE_UNAVAILABLE
+        return gave_up
     seen = 0
     emitter = None
     stand_in = None
@@ -651,13 +661,13 @@ def _reply_call_site(source: str = "generate_reply", session: Any = None,
             return owner
         if emitter is None and frame.f_code is _EMITTING_REPLY_CODE:
             emitter = frame
-        if stand_in is None and _is_stand_in_frame(frame, session):
+        if stand_in is None and _is_stand_in_frame(frame, sessions):
             stand_in = frame
         frame = frame.f_back
-    if frame is not None and not no_livekit:
+    if frame is not None:
         # The walk ran out of budget, not out of stack. The method may well be
         # further up, so nothing has been established either way.
-        return _CALL_SITE_UNAVAILABLE
+        return gave_up
     if emitter is not None:
         # The public method is absent, but the private function that emits this
         # event is not -- so the stack can still say who stood in for it.
@@ -684,7 +694,7 @@ def _reply_call_site(source: str = "generate_reply", session: Any = None,
         # weakest of the three reads and is consulted last; it is kept because
         # it names *what* stood in, which the fallback below cannot.
         return _CALL_SITE_BYPASSED
-    if source == "generate_reply" and _GENERATE_REPLY_CODE is not False:
+    if generated:
         # Nothing matched, and that is not evidence of the automatic answer.
         # LiveKit reaches `AgentActivity._generate_reply()` for it and that
         # function emits this event synchronously, so the automatic answer
@@ -695,18 +705,22 @@ def _reply_call_site(source: str = "generate_reply", session: Any = None,
         # this build is one whose emitting function could not be resolved.
         # Neither is the automatic answer, and calling it one merged an
         # application's reply backwards into the previous caller's turn with
-        # nothing recorded about it. `say()` is exempt because it emits from a
-        # different function entirely, so the emitter is legitimately absent.
+        # nothing recorded about it. Two events are exempt: `say()`, which
+        # emits from a different function entirely, and the realtime generation
+        # at `agent_activity.py:1991-2008`, which reports this same source but
+        # is not user-initiated and legitimately never passes through the
+        # emitting function either.
         return _CALL_SITE_UNAVAILABLE
     return None
 
 
-def _is_stand_in_frame(frame: Any, session: Any = None) -> bool:
+def _is_stand_in_frame(frame: Any, sessions: Any = None) -> bool:
     """Is this frame a `generate_reply` standing in for the public method?
 
     Checked only after the exact code object and the emitting function have
     both failed to appear, because a name is weaker evidence than either. The
-    receiver has to be the session being recorded, or an `AgentSession`, so an
+    receiver has to be one of the sessions being recorded, or an
+    `AgentSession`, so an
     unrelated `generate_reply` elsewhere in the process cannot answer for this
     one. `f_locals` is read only for frames already matched by name, so the
     cost falls on the rare frame rather than on every reply.
@@ -722,8 +736,9 @@ def _is_stand_in_frame(frame: Any, session: Any = None) -> bool:
         receiver = frame.f_locals.get("self")
     except Exception:  # noqa: BLE001 - an unreadable frame is not a match
         return False
-    if session is not None and receiver is session:
-        return True
+    for session in (sessions or ()):
+        if receiver is session:
+            return True
     return (_AGENT_SESSION_CLASS is not None
             and isinstance(receiver, _AGENT_SESSION_CLASS))
 
@@ -873,7 +888,7 @@ _UNAVAILABLE_REPLY_REASON = (
     "generated it automatically in answer to that caller. It may well have"
 )
 
-_TOOL_REPLY_REASON = (
+_REALTIME_TOOL_REPLY_REASON = (
     "a realtime model generated this reply server-side while a tool result on "
     "this turn was still owed an answer. LiveKit builds the identical handle "
     "for the reply to a tool result and for a reply to the speech being "
@@ -883,6 +898,28 @@ _TOOL_REPLY_REASON = (
     "the tool, which is the likelier reading -- but a caller talking over the "
     "tool call could have prompted it instead, and then these tokens belong to "
     "them"
+)
+
+_FRAMEWORK_TOOL_REPLY_REASON = (
+    "LiveKit itself asked for this reply through the public "
+    "`generate_reply()` while a tool result on this turn was still owed an "
+    "answer. Its asynchronous tool executor does exactly that once a tool "
+    "finishes out of band (voice/tool_executor.py:589-603), and the event it "
+    "produces is user-initiated and indistinguishable from any other. It was "
+    "merged into the turn that ran the tool, which is the likelier reading -- "
+    "but LiveKit's own callers are not all answers to a tool result, and a "
+    "caller talking over the tool call could have prompted it instead, and "
+    "then these tokens belong to them"
+)
+
+_RETRY_TOOL_REPLY_REASON = (
+    "this reply was reissued for a run that already exists -- a structured "
+    "output that failed to validate, or a realtime session dropping to a text "
+    "model -- while a tool result on this turn was still owed an answer. The "
+    "event carries no run identity, so which of the two it is cannot be read "
+    "from it. It was merged into the turn that ran the tool, which is the "
+    "likelier reading, but the reissued run may have been started by someone "
+    "else, and then these tokens belong to them"
 )
 
 _EXPIRED_TOOL_REPLY_REASON = (
@@ -956,6 +993,22 @@ def _reply_origin(event: Any, handle: Any, *, call_site: Optional[str],
         # which is what merging it backwards would claim.
         return _tool_or_flight(tool_reply_pending, "framework_speech")
     return "completed_turn"
+
+
+def _tool_reply_reason(call_site: Optional[str], event: Any) -> str:
+    """Say which of the three routes into `tool_reply` this reply took.
+
+    They are not one story. A realtime model generating server-side, LiveKit's
+    asynchronous tool executor calling the public method, and a reissue for an
+    existing run all settle here, and each suggests something different to
+    check. Publishing the realtime explanation for all three told an operator
+    the reply came from a path it had demonstrably not taken.
+    """
+    if getattr(event, "user_initiated", None) is False:
+        return _REALTIME_TOOL_REPLY_REASON
+    if call_site == _CALL_SITE_RETRY:
+        return _RETRY_TOOL_REPLY_REASON
+    return _FRAMEWORK_TOOL_REPLY_REASON
 
 
 def _tool_or_flight(tool_reply_pending: Any, otherwise: str) -> str:
@@ -1165,7 +1218,12 @@ class VaaniLiveKitRecorder:
         # *on it* -- the only anchor available when there is no importable
         # `livekit.agents` to match a code object against, which is the case
         # for a vendored or compatible session.
-        self._session: Any = None
+        # Every session subscribed to, not just the most recent. `attach()`
+        # accepts more than one and unsubscribes from none of them until
+        # `finish()`, so a reply arriving from an earlier session is still this
+        # recorder's to place. Keeping only the last read those replies as
+        # having no recognised receiver at all.
+        self._sessions: list = []
         # Checking `_attached` and subscribing are one decision, not two. A
         # reconnect racing a startup path could pass the check in both threads
         # before either had appended, register every handler twice, and publish
@@ -1382,7 +1440,8 @@ class VaaniLiveKitRecorder:
                 )
                 continue
             self._attached.append((session, name, wrapped))
-        self._session = session
+        if not any(known is session for known in self._sessions):
+            self._sessions.append(session)
         self._sniff_models(session)
         return self
 
@@ -1425,7 +1484,7 @@ class VaaniLiveKitRecorder:
         """
         with self._attach_lock:
             attached, self._attached = list(self._attached), []
-            self._session = None
+            self._sessions = []
         for session, name, wrapped in attached:
             off = getattr(session, "off", None)
             if off is None:
@@ -2692,7 +2751,8 @@ class VaaniLiveKitRecorder:
         # Read now, not at settlement: neither survives this handler. The call
         # frame is gone by the next loop slice, and a tool result is owed a
         # reply only until one is bound.
-        call_site = _reply_call_site(source, self._session)
+        call_site = _reply_call_site(
+            source, self._sessions, getattr(event, "user_initiated", None))
         tool_reply_pending = self._tool_reply_pending(carry)
         settle = _guard(
             self, "speech_created:contested",
@@ -2793,7 +2853,7 @@ class VaaniLiveKitRecorder:
             # was not realtime, was probably an application call, and had been
             # kept apart -- none of which is what happened.
             self._bind_reply(carry, event, speech_id, source, contested=True,
-                             reason=_TOOL_REPLY_REASON)
+                             reason=_tool_reply_reason(call_site, event))
             return
         if origin == "framework_speech":
             # Placed with the speech in flight, like any other unscheduled

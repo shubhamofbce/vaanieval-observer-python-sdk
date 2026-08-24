@@ -45,6 +45,7 @@ import logging
 import os
 import sys
 import sysconfig
+import threading
 from typing import Any, Dict, List, Mapping, Optional
 
 from .._diagnostics import warn_once
@@ -451,6 +452,34 @@ def _set_metering_scope(response: Dict[str, Any]) -> None:
 
 _GENERATE_REPLY_CODE: Any = None
 _LIVEKIT_ROOTS: tuple = ()
+_APPLICATION_ENTRY_CODES: tuple = ()
+
+# Returned when the stack could not be read, which is *not* the same answer as
+# "the public method is not on the stack". Conflating them meant a blocked
+# `sys._getframe`, a public method whose code object cannot be reached, or a
+# walk that ran out of budget were all reported as LiveKit's automatic answer to
+# the completed turn -- and merged backwards into it with no caveat, which is
+# the one direction a failure to look must never take.
+_CALL_SITE_UNAVAILABLE = "unavailable"
+
+
+def _application_entry_codes(session_cls: Any) -> tuple:
+    """LiveKit methods that only an application ever calls.
+
+    `AgentSession.run(user_input=...)` is a public entry point that forwards to
+    the public `generate_reply` (`agent_session.py:823`), so the frame above the
+    reply belongs to LiveKit while the decision to reply was the adopter's. Read
+    by filename alone it was called framework speech and silently joined to the
+    *next* spoken caller's turn -- putting a programmatic run's tokens and cost
+    on a caller who never asked for them.
+    """
+    codes = []
+    for name in ("run",):
+        method = getattr(session_cls, name, None)
+        code = getattr(method, "__code__", None)
+        if code is not None:
+            codes.append(code)
+    return tuple(codes)
 
 
 def _livekit_roots() -> tuple:
@@ -488,9 +517,11 @@ def _reply_call_site(depth_limit: int = 60) -> Optional[str]:
     that captured the bound method before `attach()` -- `send = session.
     generate_reply` -- kept calling the original and was read as LiveKit's own
     automatic answer, silently merged backwards into the previous caller's turn.
-    And LiveKit calls that same public method itself, in six places on 1.7.0
-    (`agent_activity.py:1693`, `run_result.py:292`, `tool_executor.py:599`,
-    `ivr/ivr_activity.py:53` and `:83`, `agent.py:346`), so counting calls also
+    And LiveKit calls that same public method itself, in more than a dozen
+    places on 1.7.0 -- `agent_activity.py:1693`, `run_result.py:292`,
+    `tool_executor.py:599`, `ivr/ivr_activity.py:53` and `:83`, `agent.py:346`,
+    `room_io/types.py:49`, `llm/realtime_fallback_adapter.py:394` and `:445`,
+    and ten proactive prompts across `beta/workflows/` -- so counting calls also
     reported the framework's own replies as the application's.
 
     The stack answers both, because it is the one thing a captured reference
@@ -498,31 +529,49 @@ def _reply_call_site(depth_limit: int = 60) -> Optional[str]:
     says who asked. `speech_created` is emitted synchronously inside the call
     (`agent_session.py:1508-1520`), so that frame is still there when this runs.
 
-    Returns "application", "framework", or None when the public method is not on
-    the stack at all -- which is the automatic answer, since that reaches
-    `_generate_reply` directly without passing through the public one.
+    Returns "application", "framework", `_CALL_SITE_UNAVAILABLE` when the stack
+    could not be read, or None when the public method is genuinely absent from
+    it -- which is the automatic answer, since that reaches `_generate_reply`
+    directly without passing through the public one. The last two were once the
+    same answer; they are opposite kinds of fact and are now kept apart.
     """
-    global _GENERATE_REPLY_CODE, _LIVEKIT_ROOTS
+    global _GENERATE_REPLY_CODE, _LIVEKIT_ROOTS, _APPLICATION_ENTRY_CODES
     if _GENERATE_REPLY_CODE is None:
         try:
             from livekit.agents.voice.agent_session import AgentSession
-
-            _GENERATE_REPLY_CODE = AgentSession.generate_reply.__code__
-            _LIVEKIT_ROOTS = _livekit_roots()
         except Exception:  # noqa: BLE001 - version drift is survivable
+            # There is no such public method on this build, so its absence from
+            # the stack is a fact about the call, not a failure to look.
             _GENERATE_REPLY_CODE = False
-    if not _GENERATE_REPLY_CODE:
+        else:
+            code = getattr(getattr(AgentSession, "generate_reply", None),
+                           "__code__", None)
+            if code is None:
+                # The method exists and calls really do pass through it -- there
+                # is simply nothing on the stack to match it against.
+                _GENERATE_REPLY_CODE = _CALL_SITE_UNAVAILABLE
+            else:
+                _GENERATE_REPLY_CODE = code
+                _LIVEKIT_ROOTS = _livekit_roots()
+                _APPLICATION_ENTRY_CODES = _application_entry_codes(AgentSession)
+    if _GENERATE_REPLY_CODE is False:
         return None
+    if isinstance(_GENERATE_REPLY_CODE, str):
+        return _CALL_SITE_UNAVAILABLE
     try:
         frame = sys._getframe(1)
     except Exception:  # noqa: BLE001 - no stack introspection on this runtime
-        return None
+        return _CALL_SITE_UNAVAILABLE
     seen = 0
     while frame is not None and seen < depth_limit:
         seen += 1
         if frame.f_code is _GENERATE_REPLY_CODE:
             return _caller_owner(frame.f_back)
         frame = frame.f_back
+    if frame is not None:
+        # The walk ran out of budget, not out of stack. The method may well be
+        # further up, so nothing has been established either way.
+        return _CALL_SITE_UNAVAILABLE
     return None
 
 
@@ -586,6 +635,10 @@ def _caller_owner(caller: Any, indirection_limit: int = 8) -> str:
     steps = 0
     while caller is not None and steps < indirection_limit:
         steps += 1
+        if caller.f_code in _APPLICATION_ENTRY_CODES:
+            # A LiveKit frame, but one only an adopter reaches: the decision to
+            # reply was theirs even though the file is not.
+            return "application"
         origin = os.path.abspath(caller.f_code.co_filename)
         if any(origin.startswith(root) for root in _LIVEKIT_ROOTS):
             return "framework"
@@ -599,6 +652,29 @@ def _caller_owner(caller: Any, indirection_limit: int = 8) -> str:
 # result before giving up (`agent_activity.py:4278`). A generation arriving
 # after it is not the answer that was owed.
 _TOOL_REPLY_WINDOW_MS = 5000
+
+# A tool result still owed a reply after LiveKit stopped waiting for one. Not
+# `False`: the wait ended, the provider's generation did not become impossible.
+_TOOL_REPLY_EXPIRED = "expired"
+
+_FRAMEWORK_REPLY_REASON = (
+    "LiveKit asked for this reply itself. Most of its internal calls answer "
+    "speech already under way, so it was placed with the speech in flight and "
+    "will be joined by the transcript that follows -- but the workflow and IVR "
+    "helpers prompt proactively, before the caller has said anything, and the "
+    "event is identical either way. If this was a proactive prompt, the "
+    "transcript on this turn is the caller's answer to it rather than the "
+    "question it answered"
+)
+
+_EXPIRED_TOOL_REPLY_REASON = (
+    "a tool result on the previous turn was still owed a reply when LiveKit "
+    "stopped waiting for one. Those five seconds bound LiveKit's wait "
+    "(agent_activity.py:4278), not the provider's generation, which the "
+    "already-updated chat context can still produce afterwards. So this may be "
+    "that answer, belonging to the turn that ran the tool, or a reply to the "
+    "next caller; the event says neither, so it was kept in its own turn"
+)
 
 
 def _reply_origin(event: Any, handle: Any, *, call_site: Optional[str],
@@ -642,18 +718,39 @@ def _reply_origin(event: Any, handle: Any, *, call_site: Optional[str],
     if user_initiated is None:
         return "unknown"
     if not user_initiated:
-        return "tool_reply" if tool_reply_pending else "in_flight_speech"
-    if call_site == "application":
+        return _tool_or_flight(tool_reply_pending, "in_flight_speech")
+    if call_site == "application" or call_site == _CALL_SITE_UNAVAILABLE:
         return "unknown"
     if call_site == "framework":
-        # LiveKit asking itself. Every one of these answers something already
-        # under way -- a manually committed realtime turn whose transcript
-        # follows, a retried structured output, an asynchronous tool result --
-        # so it belongs with the speech in flight or with the tool that is owed
-        # a reply. What it is never is the automatic answer to the turn a filler
-        # is holding open, which is what merging it backwards would claim.
-        return "tool_reply" if tool_reply_pending else "in_flight_speech"
+        # LiveKit asking itself. Most of these answer something already under
+        # way -- a manually committed realtime turn whose transcript follows, a
+        # retried structured output, an asynchronous tool result. But not all:
+        # `beta/workflows/` and `ivr/` prompt *proactively*, before the caller
+        # has said anything, and those are answered by the transcript that
+        # follows rather than being an answer to it. The event is identical
+        # either way, so the placement is disclosed instead of asserted. What it
+        # is never is the automatic answer to the turn a filler is holding open,
+        # which is what merging it backwards would claim.
+        return _tool_or_flight(tool_reply_pending, "framework_speech")
     return "completed_turn"
+
+
+def _tool_or_flight(tool_reply_pending: Any, otherwise: str) -> str:
+    """Resolve a reply against a tool result that may still be owed one.
+
+    `"expired"` is not `False`. LiveKit's five seconds are a wait timeout, not a
+    provenance boundary: `agent_activity.py:4278` waits on a shielded future and
+    then merely stops tracking it (`:4284-4286`), while the chat context that
+    prompts the provider was already updated at `:4291-4295`. A slow provider's
+    generation can therefore arrive after the deadline and still be the answer
+    the tool was owed. Treating that as ordinary in-flight speech asserted the
+    opposite, silently, and moved its tokens onto a later caller.
+    """
+    if tool_reply_pending is True:
+        return "tool_reply"
+    if tool_reply_pending == _TOOL_REPLY_EXPIRED:
+        return "unknown"
+    return otherwise
 
 
 def _is_unanswered_turn(state: "_TurnState", allow_filler: bool = True) -> bool:
@@ -810,6 +907,14 @@ class VaaniLiveKitRecorder:
         # be kept or `session.off()` is impossible: LiveKit matches listeners by
         # identity, and what was registered is the wrapper, not the bound method.
         self._attached: List[tuple] = []
+        # Checking `_attached` and subscribing are one decision, not two. A
+        # reconnect racing a startup path could pass the check in both threads
+        # before either had appended, register every handler twice, and publish
+        # the caller's words doubled with the manifest still reporting the
+        # capture complete -- the exact failure the idempotence guard exists to
+        # prevent, just narrower. Re-entrant because a handler registered here
+        # can reach `attach()` again on the same thread.
+        self._attach_lock = threading.RLock()
         # Failure classes already reported. Recording is best effort, but the
         # first occurrence of each distinct failure must be visible: three
         # different real bugs used to present identically as "it records
@@ -972,12 +1077,19 @@ class VaaniLiveKitRecorder:
         twice and the turn published the caller's words doubled, with the
         manifest still reporting the capture complete. Nothing downstream can
         tell a doubled transcript from a caller who repeated themselves, so this
-        is idempotent per session instead.
+        is idempotent per session instead -- and idempotent under a lock, since
+        a retry racing a reconnect can pass a bare check in both threads before
+        either has recorded that it subscribed.
         """
         if self.call is None:
             return self
-        if any(attached is session for attached, _, _ in self._attached):
-            return self
+        with self._attach_lock:
+            if any(attached is session for attached, _, _ in self._attached):
+                return self
+            return self._subscribe(session)
+
+    def _subscribe(self, session: Any) -> "VaaniLiveKitRecorder":
+        """Register every handler on a session held under the attach lock."""
         handlers = {
             "user_state_changed": self._on_user_state,
             "user_input_transcribed": self._on_transcript,
@@ -1044,7 +1156,9 @@ class VaaniLiveKitRecorder:
         call while the session keeps emitting, and every later event used to
         dereference `None`.
         """
-        for session, name, wrapped in self._attached:
+        with self._attach_lock:
+            attached, self._attached = list(self._attached), []
+        for session, name, wrapped in attached:
             off = getattr(session, "off", None)
             if off is None:
                 continue
@@ -1052,7 +1166,6 @@ class VaaniLiveKitRecorder:
                 off(name, wrapped)
             except Exception as error:  # noqa: BLE001 - teardown must not raise
                 logger.debug("vaani: cannot unsubscribe from %r (%s)", name, error)
-        self._attached.clear()
 
     async def finish(self, outcome: Optional[str] = None,
                      timeout: Optional[float] = None) -> None:
@@ -2191,7 +2304,8 @@ class VaaniLiveKitRecorder:
                          contested=reply_contested)
 
     def _bind_reply(self, state: "_TurnState", event: Any, speech_id: str,
-                    source: str, *, contested: bool) -> None:
+                    source: str, *, contested: bool,
+                    reason: Optional[str] = None) -> None:
         """Attach a reply speech to the turn that was chosen for it.
 
         Shared with the deferred settlement below so a decision taken one event
@@ -2210,7 +2324,7 @@ class VaaniLiveKitRecorder:
             # reach the expensive number either way.
             state.reply_attribution = {
                 "reply_attribution": "inferred",
-                "reply_attribution_reason": (
+                "reply_attribution_reason": reason or (
                     "a partial transcript arrived while the previous turn's "
                     "filler was still playing, and this reply's origin could "
                     "not be established: it was not the automatic answer to a "
@@ -2324,16 +2438,23 @@ class VaaniLiveKitRecorder:
         backwards as the tool's answer.
 
         `has_tool_reply` settles the first. The rest are bounded by the same
-        five seconds LiveKit waits before giving up on an auto tool reply, so a
-        generation arriving after that is not the one it was waiting for. Inside
-        that window a caller who barges in over the tool call can still be
-        confused with it, which is why the adoption is disclosed rather than
+        five seconds LiveKit waits before giving up on an auto tool reply.
+        Inside that window a caller who barges in over the tool call can still
+        be confused with it, which is why the adoption is disclosed rather than
         asserted.
+
+        Past it, the answer is `"expired"` rather than `False`. Those five
+        seconds bound how long LiveKit *waits*, not how long the provider may
+        take: the generation it stopped waiting for can still arrive, and it is
+        still the answer the tool was owed. Reporting `False` said, with no
+        caveat, that it was something else.
         """
         if not getattr(state, "awaiting_tool_reply", False):
             return False
         deadline = getattr(state, "tool_reply_deadline_ms", None)
-        return deadline is None or self.call.now() <= deadline
+        if deadline is None or self.call.now() <= deadline:
+            return True
+        return _TOOL_REPLY_EXPIRED
 
     def _settle_pending(self, speech_id: Optional[str]) -> None:
         """Settle a deferred reply before anything reads the turn it belongs to.
@@ -2386,19 +2507,40 @@ class VaaniLiveKitRecorder:
             # also have prompted it, and the event is the same either way.
             self._bind_reply(carry, event, speech_id, source, contested=True)
             return
+        if origin == "framework_speech":
+            # Placed with the speech in flight, like any other unscheduled
+            # reply -- but LiveKit's internal callers are not all answers to
+            # speech already under way, and the event cannot tell which this is.
+            self._bind_in_flight(event, speech_id, source, contested=True,
+                                 reason=_FRAMEWORK_REPLY_REASON)
+            return
         if origin == "in_flight_speech":
             # Generated for the speech still arriving, whose final transcript
             # lands after it. Tracked as preemptive so that transcript joins
             # this turn, and so a cancelled attempt's empty turn is reused
             # rather than left behind as a phantom.
-            reuse = self._preemptive_turn
-            state = reuse if reuse is not None and _is_empty_turn(reuse) else self._new_turn()
-            self._preemptive_turn = state
-            self._bind_reply(state, event, speech_id, source, contested=False)
+            self._bind_in_flight(event, speech_id, source, contested=False)
             return
         # Unknown provenance. Kept separate *and* marked, because separating is
         # itself a choice that can be wrong.
-        self._bind_reply(self._new_turn(), event, speech_id, source, contested=True)
+        reason = (_EXPIRED_TOOL_REPLY_REASON
+                  if tool_reply_pending == _TOOL_REPLY_EXPIRED else None)
+        self._bind_reply(self._new_turn(), event, speech_id, source,
+                         contested=True, reason=reason)
+
+    def _bind_in_flight(self, event: Any, speech_id: str, source: str, *,
+                        contested: bool, reason: Optional[str] = None) -> None:
+        """Bind a reply to the speech whose transcript has not landed yet.
+
+        Tracked as preemptive so that transcript joins this turn, and so a
+        cancelled attempt's empty turn is reused rather than left behind as a
+        phantom.
+        """
+        reuse = self._preemptive_turn
+        state = reuse if reuse is not None and _is_empty_turn(reuse) else self._new_turn()
+        self._preemptive_turn = state
+        self._bind_reply(state, event, speech_id, source, contested=contested,
+                         reason=reason)
 
     def open_output_stream(self) -> "_OutputStream":
         """A handle identifying one `tts_node` invocation.

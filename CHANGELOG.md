@@ -4,6 +4,59 @@ Every recorded package stamps its SDK version into the manifest, so the version
 here is what a bug report is tied back to. Entries describe what changed about
 *the data* — a fix that alters no recorded value is not worth an adopter's time.
 
+## 0.5.3
+
+An eleventh review pass, aimed at the reply-attribution work itself. It found
+that the classifier answers a narrower question than it is read as answering,
+and that two of the release's own safeguards resolve an unknown into a
+confident answer. Nothing here changes what a field means; every change either
+moves a measurement to a different turn or adds a caveat that was owed.
+
+**`session.run()` is the adopter's decision, in LiveKit's file.**
+`AgentSession.run(user_input=...)` is a public entry point that forwards to the
+public `generate_reply` (`agent_session.py:823`). The frame above the reply is
+LiveKit's own, so it was read as framework speech and joined silently to the
+*next* spoken caller's turn — putting a programmatic run's tokens and cost on
+somebody who never asked for them. LiveKit's own entry points are now
+recognised, so such a reply is kept in a turn of its own.
+
+**LiveKit's internal calls are not all answers to speech already under way.**
+The previous release asserted that they were, on the strength of six call
+sites. There are more than a dozen on 1.7.0, and ten of them — the
+`beta/workflows/` prompts — ask the caller a question *before* the caller has
+said anything. The transcript that follows such a reply is the answer to it,
+not the question it answered. The placement is unchanged, because it is still
+the likeliest reading, but it now carries a caveat naming the ambiguity instead
+of presenting one of the two readings as fact.
+
+**Five seconds bound LiveKit's wait, not the provider's generation.**
+`agent_activity.py:4278` waits on a shielded future and then merely stops
+tracking it, while the chat context that prompts the provider was already
+updated. A slow provider's answer can therefore arrive after the deadline and
+still be the one the tool was owed. It was being called ordinary in-flight
+speech — moving its tokens to the next caller, with no caveat, so the tool
+exchange read as having had no model answer at all. An expired window is now a
+third answer, distinct from "no tool is waiting", and resolves to a turn of its
+own with the reason stated.
+
+**Failing to read the stack is not evidence of an automatic answer.** A blocked
+`sys._getframe`, a public method whose code object cannot be reached and a walk
+that ran out of budget all returned the same value as "the public method is
+genuinely not on the stack" — which is LiveKit's automatic answer to a
+completed turn, merged backwards into it with no caveat. Those are opposite
+kinds of fact and are now kept apart; a failure to look is disclosed.
+
+**Attaching twice at once no longer doubles the caller's words.** Checking
+whether a session was already attached and subscribing to it were two steps, so
+a reconnect racing a startup path could pass the check in both threads and
+register every handler twice. One final transcript then published the caller's
+words doubled, with the manifest still reporting the capture complete. The
+check and the subscription are now one decision.
+
+Verified across nine routes against a real `AgentSession` on livekit-agents
+1.7.0, including `session.run()`, a bound method saved before recording
+started, and a caller compiled inside the `livekit` package.
+
 ## 0.5.2
 
 A tenth review pass, this time aimed squarely at how a reply's owner is

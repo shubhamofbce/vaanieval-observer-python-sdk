@@ -4178,7 +4178,17 @@ def public_generate_reply(monkeypatch, tmp_path):
             outer = inner["ask"]
         return namespace["call"](session, kwargs, _deferred, outer)
 
+    # `AgentSession.run()` lives in the package but is only ever reached from
+    # an adopter's code, so its frame must not be read as the framework's.
+    entry_namespace: dict = {}
+    exec(compile("def run(session, kwargs):\n"
+                 "    return session.generate_reply(**kwargs)\n",
+                 str((root / "voice" / "agent_session.py").resolve()), "exec"),
+         entry_namespace)
+    monkeypatch.setattr(livekit_integration, "_APPLICATION_ENTRY_CODES",
+                        (entry_namespace["run"].__code__,))
     framework_caller.package_root = root.parent
+    framework_caller.entry_caller = entry_namespace["run"]
     return framework_caller
 
 
@@ -4482,8 +4492,9 @@ async def test_a_livekit_plugin_asking_for_a_reply_is_not_the_application(
     first = next(op for op in ops if op["type"] == "stt"
                  and "What is the fare?" in (op["response"].get("transcript") or ""))
     assert llm["turn_id"] != first["turn_id"]
-    assert llm["response"].get("reply_attribution") is None, (
-        "a plugin's own call was reported as the application's guesswork"
+    assert "LiveKit asked for this reply itself" in (
+        llm["response"].get("reply_attribution_reason") or ""), (
+        "a plugin's own call was not recorded as LiveKit's own"
     )
 
 
@@ -4526,9 +4537,9 @@ async def test_a_reply_livekit_asked_for_through_the_stdlib_is_still_livekits(
     reply = next(op for op in operations(read_events(_dir(rec)))
                  if op["type"] == "tts"
                  and op["response"].get("audio_ms") == 2000)
-    assert reply["response"].get("reply_attribution") is None, (
-        "a reply LiveKit asked for indirectly was published as the "
-        "application's guesswork"
+    assert "LiveKit asked for this reply itself" in (
+        reply["response"].get("reply_attribution_reason") or ""), (
+        "a reply LiveKit asked for indirectly was not recorded as its own"
     )
 
 
@@ -4613,6 +4624,183 @@ async def test_a_project_directory_beside_the_package_is_still_the_application(
                if op["type"] == "tts" and op["response"].get("audio_ms") == 2000)
     assert llm["response"].get("reply_attribution") == "inferred", (
         "an application module beside the package was taken for the framework"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_reply_the_application_asked_for_through_livekits_own_api(
+        recorder, public_generate_reply):
+    """`AgentSession.run()` is the adopter's decision in LiveKit's file.
+
+    `run(user_input=...)` is a public entry point that forwards to the public
+    `generate_reply` (`agent_session.py:823`). Read by filename alone the frame
+    above the reply belongs to LiveKit, so the reply was called framework speech
+    and silently joined to the *next* spoken caller's turn -- putting a
+    programmatic run's tokens and cost on a caller who never asked for them, and
+    saying so with no caveat. There is no caller speech behind such a reply at
+    all, so it belongs in a turn of its own.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    rec.note_audio_tap_installed()
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("What is the fare?", True))
+    session.emit("conversation_item_added", chat_item("user", "What is the fare?"))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("filler-1"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    # Somebody starts talking over the filler, and before their words go final
+    # the application drives a programmatic run.
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("And to Boston?", False))
+    public_generate_reply.entry_caller(session, {"handle_id": "run-reply"})
+    session.emit("metrics_collected", llm_metrics("run-reply"))
+    session.emit("user_input_transcribed", transcript("And to Boston?", True))
+    session.emit("conversation_item_added", chat_item("user", "And to Boston?"))
+    await rec.finish()
+
+    ops = operations(read_events(_dir(rec)))
+    llm = next(op for op in ops if op["type"] == "llm")
+    later = next(op for op in ops if op["type"] == "stt"
+                 and "And to Boston?" in (op["response"].get("transcript") or ""))
+    assert llm["turn_id"] != later["turn_id"], (
+        "a programmatic run's tokens were billed to a caller who never asked "
+        "for them, because the frame above the reply was LiveKit's own file"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_tool_reply_arriving_after_livekit_gave_up_is_not_asserted_away(
+        recorder):
+    """Five seconds bound LiveKit's wait, not the provider's generation.
+
+    `agent_activity.py:4278` waits on a shielded future and then merely stops
+    tracking it (`:4284-4286`); the chat context that prompts the provider was
+    already updated at `:4291-4295`. So a slow provider can emit the generation
+    the tool was owed after the deadline. Calling that ordinary in-flight speech
+    moved its tokens onto the next caller and said so with no caveat -- the tool
+    exchange then reads as having had no model answer at all.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    rec.note_audio_tap_installed()
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("book it", True))
+    session.emit("conversation_item_added", chat_item("user", "book it"))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("filler-1"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    session.emit("function_tools_executed", tools_executed())
+    # Past the window LiveKit waits, with the provider's answer still to come.
+    rec._current_turn.tool_reply_deadline_ms = rec.call.now() - 1
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("hello?", False))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("late-reply"),
+                                user_initiated=False))
+    session.emit("metrics_collected", llm_metrics("late-reply"))
+    await rec.finish()
+
+    llm = next(op for op in operations(read_events(_dir(rec)))
+               if op["type"] == "llm")
+    assert llm["response"].get("reply_attribution") == "inferred", (
+        "a generation arriving after LiveKit stopped waiting was placed as "
+        "though its origin were known"
+    )
+    assert "stopped waiting" in (
+        llm["response"].get("reply_attribution_reason") or ""), (
+        "the caveat must say the tool's answer may have arrived late"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_stack_that_cannot_be_read_is_not_proof_of_an_automatic_answer(
+        recorder, monkeypatch):
+    """Failing to look is not the same fact as looking and finding nothing.
+
+    `None` meant "the public method is not on the stack", which is LiveKit's own
+    automatic answer to a completed turn -- merged backwards into it with no
+    caveat. A blocked `sys._getframe`, an unreachable code object or a walk that
+    ran out of budget returned the same `None`, so an unrelated application
+    reply was published as the certain answer to whoever spoke last.
+    """
+    # The code object cannot be reached on this build, which is one of the
+    # three ways the lookup fails; a blocked `sys._getframe` and a walk that
+    # ran out of budget reach the same sentinel and the same branch below.
+    monkeypatch.setattr(livekit_integration, "_GENERATE_REPLY_CODE",
+                        livekit_integration._CALL_SITE_UNAVAILABLE)
+
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    rec.note_audio_tap_installed()
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("What is the fare?", True))
+    session.emit("conversation_item_added", chat_item("user", "What is the fare?"))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("filler-1"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("And to Boston?", False))
+    session.generate_reply(handle_id="app-reply")
+    session.emit("metrics_collected", llm_metrics("app-reply"))
+    await rec.finish()
+
+    ops = operations(read_events(_dir(rec)))
+    llm = next(op for op in ops if op["type"] == "llm")
+    question = next(op for op in ops if op["type"] == "stt"
+                    and "What is the fare?" in (op["response"].get("transcript") or ""))
+    assert llm["turn_id"] != question["turn_id"], (
+        "a reply whose origin could not be read was merged into the caller's "
+        "turn as though it were LiveKit's answer to them"
+    )
+    assert llm["response"].get("reply_attribution") == "inferred", (
+        "a failure to read the stack must be disclosed, not resolved silently"
+    )
+
+
+@pytest.mark.asyncio
+async def test_two_threads_attaching_at_once_still_subscribe_once(recorder):
+    """Idempotence has to hold when both callers arrive together.
+
+    A retry and a reconnect racing each other could both find nothing attached
+    before either had finished subscribing, register every handler twice, and
+    publish the caller's words doubled -- with the manifest still reporting the
+    capture complete, so nothing downstream could tell it from a caller who
+    repeated themselves. The sleep only widens the window that already exists.
+    """
+    import threading, time
+
+    class SlowSession(FakeAgentSession):
+        def on(self, name, handler):
+            time.sleep(0.02)
+            super().on(name, handler)
+
+    rec = recorder()
+    session = SlowSession()
+    threads = [threading.Thread(target=rec.attach, args=(session,)) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert {len(handlers) for handlers in session.handlers.values()} == {1}, (
+        "a concurrent attach registered a second copy of every handler"
+    )
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("hello", True))
+    session.emit("conversation_item_added", chat_item("user", "hello"))
+    rec.note_audio_tap_installed()
+    await rec.finish()
+
+    stt = next(op for op in operations(read_events(_dir(rec))) if op["type"] == "stt")
+    assert stt["response"]["transcript"] == "hello", (
+        "a concurrent attach published the caller's words twice"
     )
 
 
@@ -4703,8 +4891,9 @@ async def test_livekits_own_call_to_the_public_method_is_not_the_applications(
         "the reply and the question it answers were recorded two turns apart, "
         "so the turn has tokens with no question and the question has no answer"
     )
-    assert llm["response"].get("reply_attribution") is None, (
-        "the framework's own call is not a guess: the stack says who made it"
+    assert "LiveKit asked for this reply itself" in (
+        llm["response"].get("reply_attribution_reason") or ""), (
+        "the framework's own call was not recorded as LiveKit's own"
     )
 
 

@@ -3634,3 +3634,411 @@ async def test_a_cancelled_preemptive_reply_never_swallows_the_rest_of_the_quest
         "the tokens belong to the audio that caused them, not to the "
         f"continuation: {billed[0]['turn_id']} vs {heard_first}"
     )
+
+
+async def test_every_billing_tick_the_recogniser_sends_is_counted(recorder):
+    """Deepgram meters a stream in *increments* -- one every five seconds and a
+    remainder on close -- and LiveKit forwards each as its own metric. Keeping
+    only the latest published four seconds for a nine-second stretch: an
+    understatement of the provider's own billing number, on a healthy call."""
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("metrics_collected", stt_metrics(audio_duration=5.0))
+    session.emit("metrics_collected", stt_metrics(audio_duration=4.0))
+    session.emit("user_input_transcribed", transcript("hello there", True))
+    await rec.finish()
+
+    stt = [op for op in operations(read_events(_dir(rec))) if op["type"] == "stt"][0]
+    assert stt["response"]["provider_metered_audio_ms"] == 9000, stt["response"]
+
+
+async def test_a_filler_spoken_first_never_takes_the_callers_turn(recorder):
+    """The filler is the *first* speech after the caller's final, so nothing
+    has claimed the pending turn yet. Letting it in bills "let me check that"
+    to the caller's question and leaves the real answer in a turn with no
+    question in it -- both numbers wrong, on a call reporting full coverage."""
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("what is my balance", True))
+    session.emit("speech_created", speech_created(FakeSpeechHandle("filler"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler", audio_duration=0.4))
+    session.emit("speech_created", speech_created(FakeSpeechHandle("answer")))
+    session.emit("metrics_collected", tts_metrics("answer", audio_duration=2.0))
+    await rec.finish()
+
+    ops = operations(read_events(_dir(rec)))
+    heard = [op for op in ops if op["type"] == "stt"][0]
+    on_the_question = [op["response"]["audio_ms"] for op in ops
+                       if op["type"] == "tts" and op["turn_id"] == heard["turn_id"]]
+    assert on_the_question == [2000], (
+        "the question is answered by the generated reply and billed for it "
+        f"alone -- the filler is not part of the answer: {on_the_question}"
+    )
+    elsewhere = [op["response"]["audio_ms"] for op in ops
+                 if op["type"] == "tts" and op["turn_id"] != heard["turn_id"]]
+    assert elsewhere == [400], f"the filler is still recorded, apart: {elsewhere}"
+
+
+async def test_a_scripted_answer_still_belongs_to_the_question(recorder):
+    """The other half of the rule. An agent that answers with `say()` and
+    raises StopResponse produces no generated reply at all, so refusing every
+    `say()` would detach every scripted answer from its question."""
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("what are your hours", True))
+    session.emit("conversation_item_added", chat_item("user", "what are your hours"))
+    session.emit("speech_created", speech_created(FakeSpeechHandle("scripted"), source="say"))
+    session.emit("metrics_collected", tts_metrics("scripted"))
+    await rec.finish()
+
+    ops = operations(read_events(_dir(rec)))
+    heard = [op for op in ops if op["type"] == "stt"][0]
+    spoke = [op for op in ops if op["type"] == "tts"][0]
+    assert spoke["turn_id"] == heard["turn_id"], (
+        "a scripted reply is still this question's answer"
+    )
+
+
+async def test_a_turn_callback_that_crashes_is_not_recorded_as_a_mute_agent(recorder):
+    """LiveKit catches any other exception from `on_user_turn_completed`, logs
+    it and returns: no commit, no reply. Unlabelled that is a transcript with
+    no answer and nothing saying why -- indistinguishable from a TTS that
+    never sounded, which needs the opposite response."""
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    agent = FakeAgent(raises=ValueError("policy lookup failed"))
+    rec.watch_agent(agent)
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("is my card blocked", True))
+    with pytest.raises(ValueError):
+        await agent.on_user_turn_completed(None, None)
+    await rec.finish()
+
+    stt = [op for op in operations(read_events(_dir(rec))) if op["type"] == "stt"][0]
+    assert stt["response"]["reply_skipped"] == "callback_error", stt["response"]
+
+
+async def test_a_stop_response_subclass_is_still_a_stop_response(recorder):
+    """LiveKit catches it by inheritance, so an agent that subclasses it to
+    carry a reason is ignoring the utterance exactly as much."""
+    class PolicyStop(StopResponse):
+        pass
+
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    agent = FakeAgent(raises=PolicyStop())
+    rec.watch_agent(agent)
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("read me the pin", True))
+    with pytest.raises(PolicyStop):
+        await agent.on_user_turn_completed(None, None)
+    await rec.finish()
+
+    stt = [op for op in operations(read_events(_dir(rec))) if op["type"] == "stt"][0]
+    assert stt["response"]["reply_skipped"] == "stop_response", stt["response"]
+
+
+async def test_an_agent_reused_for_a_second_call_is_watched_by_that_call(recorder):
+    """The wrapper's closure holds the recorder that installed it. An agent
+    object reused for the next call still carries the finished recorder's
+    wrapper, so treating "already wrapped" as "already watched" left the new
+    call with no turn watch and merged the ignored utterance into the next."""
+    first = recorder()
+    agent = FakeAgent(raises=StopResponse())
+    first.attach(FakeAgentSession())
+    first.watch_agent(agent)
+    await first.finish()
+
+    second = recorder()
+    session = FakeAgentSession()
+    second.attach(session)
+    second.watch_agent(agent)
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("ignore this one", True))
+    with pytest.raises(StopResponse):
+        await agent.on_user_turn_completed(None, None)
+    session.emit("user_input_transcribed", transcript("but not this one", True))
+    await second.finish()
+
+    ops = operations(read_events(_dir(second)))
+    said = [op["response"]["transcript"] for op in ops if op["type"] == "stt"]
+    assert said == ["ignore this one", "but not this one"], said
+    skipped = [op["response"].get("reply_skipped") for op in ops if op["type"] == "stt"]
+    assert skipped[0] == "stop_response", skipped
+
+
+async def test_an_agent_handed_off_mid_call_is_instrumented_too(recorder, tmp_path):
+    """LiveKit supports replacing the agent mid-session. The replacement gets
+    neither `agent.vaani` nor the turn watch, so the rest of the call captures
+    no agent audio at all -- and nothing about the recording looks wrong,
+    because the audio that is missing was never announced."""
+    class SessionWithHandoff(FakeAgentSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.handed_to: list[Any] = []
+
+        def update_agent(self, agent, *args, **kwargs):
+            self.handed_to.append(agent)
+            return "livekit-result"
+
+    rec = recorder()
+    session = SessionWithHandoff()
+    first = FakeAgent()
+    observe_agent_session(session, rec, agent=first)
+
+    replacement = FakeAgent()
+    assert session.update_agent(replacement) == "livekit-result", (
+        "following the handoff must not change what LiveKit returns"
+    )
+    assert session.handed_to == [replacement], "LiveKit still performs the handoff"
+    assert replacement.vaani is rec, "the replacement must be able to tap audio"
+    assert getattr(replacement.on_user_turn_completed, "_vaani_watch", None) is rec
+    await rec.finish()
+
+
+@pytest.mark.asyncio
+async def test_a_turn_we_split_says_so_instead_of_quietly_skewing_the_average(recorder):
+    """LiveKit committed one message; we recorded two. Say which two.
+
+    We split only when keeping the caller's words requires it, and the split is
+    defensible. What is not defensible is letting it disappear: per-turn latency
+    and answer attribution stop matching the framework's history at that point,
+    and an average over the two halves is not the average anyone thinks they are
+    reading. The link back is what lets a reader put the halves together again.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("Thanks.", True))
+    session.emit("speech_created", speech_created(SimpleNamespace(id="speech-1")))
+    # The filler ends -- and publishes -- the span carrying "Thanks.".
+    session.emit("speech_created",
+                 speech_created(SimpleNamespace(id="filler-1"), source="say"))
+    session.emit("user_input_transcribed", transcript("That is all I needed.", True))
+    session.emit("conversation_item_added",
+                 chat_item("user", "Thanks. That is all I needed."))
+    await rec.finish()
+
+    stt_ops = [e for e in operations(read_events(_dir(rec))) if e["type"] == "stt"]
+    assert [op["response"]["transcript"] for op in stt_ops] == [
+        "Thanks.", "That is all I needed."
+    ], "the split itself is the premise of this test"
+    first, second = stt_ops
+
+    # The second half must name the first, and say why it could not be merged.
+    assert second["response"].get("continues_turn") == first["turn_id"], (
+        "a reader given only the second half cannot tell it is half of "
+        "anything unless we point at the other half"
+    )
+    assert second["response"].get("split_reason") == "earlier_words_already_published"
+    # And an ordinary opening turn must not claim to continue anything.
+    assert "continues_turn" not in first["response"]
+
+
+@pytest.mark.asyncio
+async def test_usage_metered_after_the_final_bills_the_caller_who_earned_it(recorder):
+    """OpenAI meters *after* the transcript is final. That is not the next caller.
+
+    The recogniser queues the final transcript first and the usage for it second
+    (`plugins/openai/stt.py:895`), by which time the pending span has already
+    been swapped out. Adding it there charged one caller's speech to whoever
+    spoke next -- wrong in a direction no downstream check can catch, because
+    both turns still look complete. Token counts were dropped outright.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("First caller speaking.", True))
+    # Usage for the message that just went final, with nothing yet spoken after it.
+    session.emit("metrics_collected",
+                 stt_metrics(audio_duration=2.0, input_tokens=140, output_tokens=12))
+    session.emit("conversation_item_added", chat_item("user", "First caller speaking."))
+    session.emit("user_input_transcribed", transcript("Second thing entirely.", True))
+    session.emit("conversation_item_added", chat_item("user", "Second thing entirely."))
+    await rec.finish()
+
+    stt_ops = [e for e in operations(read_events(_dir(rec))) if e["type"] == "stt"]
+    first = next(op for op in stt_ops
+                 if op["response"]["transcript"] == "First caller speaking.")
+    second = next(op for op in stt_ops
+                  if op["response"]["transcript"] == "Second thing entirely.")
+
+    assert first["response"]["provider_metered_audio_ms"] == 2000, (
+        "the audio was metered against the message that had just gone final"
+    )
+    assert not second["response"].get("provider_metered_audio_ms"), (
+        "the second caller never incurred this; billing them is the actual defect"
+    )
+    # And the tokens the provider charges for must survive at all.
+    assert first["response"]["input_tokens"] == 140
+    assert first["response"]["output_tokens"] == 12
+    # Say that the number arrived out of band, so a reader can audit the choice.
+    assert first["response"]["metered_after_final"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_filler_said_inside_the_callback_does_not_pass_as_the_answer(recorder):
+    """Nothing at the time a `say()` is made can tell a filler from an answer.
+
+    Said inside `on_user_turn_completed`, the caller's message is already
+    committed, so the "is the message still open" rule that catches an
+    interjection cannot help: LiveKit's `SpeechCreatedEvent` carries no intent
+    (`events.py:474`). What settles it is what happens next -- if a generated
+    reply follows, the filler was not the answer. Reported as one number, a
+    400ms "let me check" plus a 2000ms answer reads as a 2400ms answer, and
+    every reply-duration statistic drifts up by however chatty the filler is.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("What is the fare?", True))
+    session.emit("conversation_item_added", chat_item("user", "What is the fare?"))
+    # Said from inside the callback: after the commit, before the real answer.
+    session.emit("speech_created",
+                 speech_created(SimpleNamespace(id="filler-1"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
+    # LiveKit then generates the answer it was always going to give.
+    session.emit("speech_created", speech_created(SimpleNamespace(id="answer-1")))
+    session.emit("metrics_collected", tts_metrics("answer-1", audio_duration=2.0))
+    await rec.finish()
+
+    ops = operations(read_events(_dir(rec)))
+    tts = [op for op in ops if op["type"] == "tts"]
+    assert len(tts) == 1, "both played on the caller's turn; that part was right"
+    response = tts[0]["response"]
+
+    # The total may stay 2400ms -- the caller really did hear that much -- but
+    # it must not be presentable as the answer's own duration.
+    assert response.get("reply_includes_filler") is True
+    assert response.get("filler_audio_ms") == 400, (
+        "without this the answer is indistinguishable from a 2400ms one"
+    )
+    assert response["audio_ms"] == 2400
+
+
+@pytest.mark.asyncio
+async def test_a_handoff_to_an_untapped_agent_stops_certifying_the_call(recorder):
+    """The first agent's tap must not vouch for the one that replaced it.
+
+    `agent_audio_tapped` is sticky on purpose: it answers "was capture ever
+    possible", which is what separates a silent agent from an unbound one. But
+    a handoff to an agent whose `tts_node` is not the mixin's means everything
+    said from that point is unrecorded, and the sticky flag let the earlier
+    agent's tap certify that silence -- the SDK logged the loss and the manifest
+    called the call complete in the same breath.
+    """
+    class _Framework:
+        async def tts_node(self, text, model_settings):  # noqa: ANN001
+            yield None
+
+    class Tapped(VaaniAudioTapMixin, _Framework):
+        pass
+
+    class Untapped(_Framework, VaaniAudioTapMixin):
+        # `Agent` wins the MRO, so the tapping node is never the one called.
+        pass
+
+    rec = recorder()
+    first = Tapped()
+    first.vaani = rec
+    rec.note_audio_tap_installed(first)
+    session = FakeAgentSession()
+    rec.attach(session)
+
+    replacement = Untapped()
+    rec.bind_agent(replacement)
+    await rec.finish()
+
+    capture = _manifest_of(rec)["capture_status"]
+    # Capture *was* possible once; that stays true and stays useful.
+    assert capture["measured"]["agent_audio_tapped"] is True
+    assert capture["coverage_complete"] is False, (
+        "known loss the manifest was reporting as a complete capture"
+    )
+    assert any(gap.get("agent_tap_lost_on_handoff")
+               for gap in capture["coverage_gaps"])
+
+
+@pytest.mark.asyncio
+async def test_reusing_an_agent_does_not_stack_a_wrapper_per_call(recorder):
+    """A shared agent is reused precisely where call volume is highest.
+
+    Each wrapper closes over the previous one and over the recorder that
+    installed it, so wrapping afresh every call grows the callback chain and
+    pins every finished recorder in memory -- unbounded, on the deployments
+    least able to absorb it.
+    """
+    agent = FakeAgent()
+    original = agent.on_user_turn_completed
+
+    recorders = []
+    for _ in range(4):
+        rec = recorder()
+        recorders.append(rec)
+        rec.watch_agent(agent)
+
+    watcher = agent.on_user_turn_completed
+    assert getattr(watcher, "_vaani_watch", None) is recorders[-1], (
+        "the live call must be the one being watched"
+    )
+    # Exactly one layer, wrapping the agent's own method -- not the previous
+    # wrapper, and not three dead recorders behind it.
+    assert getattr(watcher, "_vaani_wrapped", None) == original
+    for rec in recorders:
+        await rec.finish()
+
+
+@pytest.mark.asyncio
+async def test_the_answers_words_are_not_filed_under_a_filler_that_spoke_last(recorder):
+    """Found on a live call: two turns, both captioned with the answer's words.
+
+    `conversation_item_added(assistant)` carries no speech id, so the reply is
+    resolved to whichever turn is currently speaking. A filler created after the
+    answer makes *itself* the speaking turn, and the answer's transcript is
+    filed under a turn that only ever said "let me check that for you" -- while
+    the real answer keeps its own copy. A reader sees the same sentence twice,
+    once against audio that never contained it.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("What is the fare?", True))
+    session.emit("conversation_item_added", chat_item("user", "What is the fare?"))
+    session.emit("speech_created", speech_created(SimpleNamespace(id="answer-1")))
+    session.emit("metrics_collected", tts_metrics("answer-1", audio_duration=2.0))
+    rec.tap_output_frame(agent_frame(2000))
+    # The filler is created after the answer, so it is the live speaking turn.
+    session.emit("speech_created",
+                 speech_created(SimpleNamespace(id="filler-1"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    session.emit("conversation_item_added",
+                 chat_item("assistant", "The cheapest fare is 120 dollars."))
+    await rec.finish()
+
+    tts = [op for op in operations(read_events(_dir(rec))) if op["type"] == "tts"]
+    captioned = [op for op in tts
+                 if "cheapest fare" in (op["response"].get("text") or "")]
+    # The reply these words belong to was published before they arrived, so
+    # there is nowhere honest left to put them. The filler is not an answer of
+    # last resort: it was handed its own script and never said this.
+    assert not any(op["response"].get("audio_ms") == 400 for op in captioned), (
+        "the answer's transcript filed against audio that never contained it"
+    )
+    # Dropped, but never quietly: a reader can see that words went missing.
+    capture = _manifest_of(rec)["capture_status"]
+    assert capture["coverage_complete"] is False
+    assert any("dropped rather than attributed" in (gap.get("reason") or "")
+               for gap in capture["coverage_gaps"])

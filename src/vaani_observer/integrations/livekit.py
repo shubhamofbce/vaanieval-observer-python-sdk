@@ -368,11 +368,19 @@ class _TurnState:
 
 
 def _is_unanswered_turn(state: "_TurnState") -> bool:
-    """True when a turn has the caller's words but nothing said back yet."""
+    """True when a turn has the caller's words but nothing said back yet.
+
+    A `say()` is speech, not an answer. Counting a filler as one made the turn
+    look answered, so LiveKit's real reply -- generated moments later for that
+    exact message -- was refused and recorded in a turn of its own, with no
+    question in it. The caller's turn then read as unanswered while the answer
+    read as unprompted, which is the same exchange described wrongly twice.
+    """
+    filler_only = state.reply_source == "say" and not state.llm and not state.tools
     return (
         not state.llm
-        and state.tts is None
-        and state.audio_bytes == 0
+        and (state.tts is None or filler_only)
+        and (state.audio_bytes == 0 or filler_only)
         and not state.tools
         and not state.open_streams
     )
@@ -529,6 +537,15 @@ class VaaniLiveKitRecorder:
         # indistinguishable from one that was never wired -- and those two need
         # opposite responses from whoever reads the call.
         self._agent_audio_tapped = False
+        # A handoff can replace a correctly tapped agent with an untapped one.
+        # `_agent_audio_tapped` is sticky by design -- it answers "was capture
+        # ever possible" -- so on its own it would let the first agent's tap
+        # certify the silence that follows.
+        self._agent_tap_lost = False
+        # The turn whose STT span most recently stopped collecting. A recogniser
+        # that meters *after* the final needs somewhere to put the usage that is
+        # not the next caller's turn.
+        self._last_closed_stt_turn: Optional["_TurnState"] = None
         # An agent was handed to us, so "nothing was measured" is a wiring
         # fault we can name rather than a caller who never asked to be measured.
         self._agent_bound = False
@@ -868,6 +885,27 @@ class VaaniLiveKitRecorder:
         # capture tells an operator their numbers are trustworthy at the one
         # moment they are least able to be. A correctly wired agent that simply
         # never spoke stays distinguishable, because its tap *was* installed.
+        if self._agent_tap_lost:
+            # Known loss. The manifest previously said `coverage_complete` here
+            # while the process log said the opposite, which is the worst of
+            # both: the operator is told the numbers are whole by the same
+            # system that already knows they are not.
+            logger.warning(
+                "vaani: the call was handed off to an agent whose tts_node is not "
+                "VaaniAudioTapMixin's, so no agent audio was captured after the "
+                "handoff. Declare the mixin first on every agent in the call: "
+                "`class MyAgent(VaaniAudioTapMixin, Agent)`."
+            )
+            try:
+                report(
+                    "tts",
+                    "the call was handed off to an untapped agent, so agent audio "
+                    "after the handoff was never captured",
+                    agent_audio_tapped=True,
+                    agent_tap_lost_on_handoff=True,
+                )
+            except Exception as error:  # noqa: BLE001 - teardown must not raise
+                logger.debug("vaani: cannot record coverage gap (%s)", error)
         if not self._agent_audio_tapped:
             # `_agent_bound` selects the *advice*, never whether to speak up.
             # Gating the gap on it meant a recorder attached without `agent=`
@@ -1251,6 +1289,17 @@ class VaaniLiveKitRecorder:
         """Record one caller PCM frame. Called from `Agent.stt_node`."""
         self._tap(frame, inbound=True)
 
+    def bind_agent(self, agent: Any) -> None:
+        """Everything an agent object needs to be recorded, in one place.
+
+        Called for the agent passed to `observe_agent_session` and again for
+        any agent LiveKit hands off to mid-call, so a replacement is never
+        left uninstrumented.
+        """
+        agent.vaani = self
+        self.note_audio_tap_installed(agent)
+        self.watch_agent(agent)
+
     def watch_agent(self, agent: Any) -> None:
         """Learn when LiveKit ends a user turn, including turns it never commits.
 
@@ -1271,8 +1320,17 @@ class VaaniLiveKitRecorder:
         the call.
         """
         original = getattr(agent, "on_user_turn_completed", None)
-        if original is None or getattr(original, "_vaani_watch", False):
+        # Identity, not a flag: an agent object reused for a second call still
+        # carries the first call's wrapper, whose closure holds the *finished*
+        # recorder. Treating that as "already watched" left this call with no
+        # turn watch at all.
+        if original is None or getattr(original, "_vaani_watch", None) is self:
             return
+        # Wrap the agent's own method, never another recorder's wrapper. A
+        # shared agent reused across calls would otherwise gain a layer -- and
+        # retain a finished recorder -- every call, growing without bound on
+        # exactly the deployments that reuse agents because volume is high.
+        original = getattr(original, "_vaani_wrapped", original)
 
         async def _on_user_turn_completed(turn_ctx: Any, new_message: Any) -> Any:
             self._bookkeep("user-turn-ended", self._note_user_turn_ended)
@@ -1280,14 +1338,22 @@ class VaaniLiveKitRecorder:
                 result = original(turn_ctx, new_message)
                 return await result if inspect.isawaitable(result) else result
             except BaseException as exc:
-                # `StopResponse` is how an agent says "ignore this utterance".
-                # Matched by name so the SDK keeps working against a LiveKit
-                # build that moves it, and re-raised either way.
-                if type(exc).__name__ == "StopResponse":
+                if _is_stop_response(exc):
                     self._bookkeep("user-turn-dropped", self._note_user_turn_dropped)
+                elif isinstance(exc, Exception):
+                    # LiveKit catches any other Exception here, logs it and
+                    # returns (agent_activity.py:2483): the message is never
+                    # committed and no reply is generated. Unlabelled, that is a
+                    # turn with a transcript, no answer and nothing anywhere
+                    # saying why -- which reads as a mute agent.
+                    self._bookkeep(
+                        "user-turn-failed",
+                        lambda: self._note_user_turn_dropped("callback_error"),
+                    )
                 raise
 
-        _on_user_turn_completed._vaani_watch = True  # type: ignore[attr-defined]
+        _on_user_turn_completed._vaani_watch = self  # type: ignore[attr-defined]
+        _on_user_turn_completed._vaani_wrapped = original  # type: ignore[attr-defined]
         try:
             agent.on_user_turn_completed = _on_user_turn_completed
         except Exception:
@@ -1319,11 +1385,11 @@ class VaaniLiveKitRecorder:
         if carry is not None:
             carry.user_committed = True
 
-    def _note_user_turn_dropped(self) -> None:
-        """The agent ignored this utterance, so no reply is coming for it."""
+    def _note_user_turn_dropped(self, reason: str = "stop_response") -> None:
+        """No reply is coming for this utterance, and here is why."""
         carry = self._collecting_turn
         if carry is not None and carry.stt is not None:
-            carry.stt_response["reply_skipped"] = "stop_response"
+            carry.stt_response["reply_skipped"] = reason
 
     def note_audio_tap_installed(self, agent: Any = None) -> None:
         """Record that this recorder is positioned to measure the agent.
@@ -1349,6 +1415,11 @@ class VaaniLiveKitRecorder:
                 "so no agent audio can be captured. Declare the mixin *first*: "
                 "`class MyAgent(VaaniAudioTapMixin, Agent)`.",
             )
+            # If a tap was already running, this is a mid-call handoff to an
+            # agent we cannot hear. Everything it says goes unrecorded, and the
+            # earlier agent's tap must not be allowed to certify the call.
+            if self._agent_audio_tapped:
+                self._agent_tap_lost = True
             return
         self._agent_audio_tapped = True
 
@@ -1542,6 +1613,20 @@ class VaaniLiveKitRecorder:
                 and _is_unanswered_turn(carry)):
             self._extend_user_turn(carry, text, at, pending, reason)
             return
+        # The one case where we knowingly disagree with LiveKit's own turn
+        # boundary: every merge condition held except that the span carrying
+        # the earlier words is already published. We keep the words by opening
+        # a second turn, so LiveKit will commit one message where we recorded
+        # two -- and per-turn latency and answer attribution stop matching the
+        # framework's history from here. That is a real cost, so it is recorded
+        # rather than left for someone to discover in an average.
+        # marker:r12-split-recorded
+        continues = (carry.id if (carry is not None
+                                  and not carry.user_committed
+                                  and carry.stt is not None
+                                  and carry.stt.ended
+                                  and self._preemptive_turn is None
+                                  and _is_unanswered_turn(carry)) else None)
         # A preemptive reply is only ever generated from the utterance that is
         # still open, and clearing it here is what keeps it from claiming the
         # next one: it is set while `_pending_stt` is live and consumed the
@@ -1599,9 +1684,13 @@ class VaaniLiveKitRecorder:
         # says so: as `audio_ms` it read as speech duration and a real merged
         # turn showed 5000ms of "audio" on a 2975ms span.
         response["provider_metered_audio_ms"] = pending.metrics.get("audio_ms")
+        if continues is not None:
+            response["continues_turn"] = continues
+            response["split_reason"] = "earlier_words_already_published"
         state.stt = operation
         state.stt_response = response
         state.stt_ended_at = at
+        self._last_closed_stt_turn = state
 
     def _extend_user_turn(self, state: "_TurnState", text: str, at: int,
                           pending: "_PendingStt", reason: str) -> None:
@@ -1665,6 +1754,21 @@ class VaaniLiveKitRecorder:
             self._speaking_turn = self._turns[speech_id]
             return
         state = self._pending_turn
+        if (state is not None
+                and source != "generate_reply"
+                and not state.user_committed):
+            # A `say()` while the caller's message is still open is a filler
+            # spoken *at* them -- "let me look that up" -- not an answer to it.
+            # Letting it take the pending turn bills its audio to their question
+            # and leaves the real reply in a turn with no question in it.
+            #
+            # Once LiveKit has ended that message a `say()` is the opposite
+            # case: an agent that answers with a scripted line and raises
+            # StopResponse produces no generated reply at all, so refusing it
+            # here would record every scripted answer detached from its
+            # question.
+            # marker:r12-filler-not-pending
+            state = None
         if state is not None and state.reply_source is not None:
             # The pending turn already has a reply speech bound to it. That can
             # only happen after a preemptive reply was merged below, and a
@@ -1719,6 +1823,23 @@ class VaaniLiveKitRecorder:
             # speech at all.
             state = self._new_turn()
         self._pending_turn = None
+        # A filler said *inside* `on_user_turn_completed` is spoken after the
+        # caller's message is committed and before LiveKit generates the real
+        # answer, so nothing at the time it is said can tell it from a scripted
+        # answer -- `SpeechCreatedEvent` carries no intent (events.py:474).
+        # The generated reply arriving here is what settles it, retroactively:
+        # an answer followed the filler, so the filler was not the answer. Both
+        # play on this turn and both are the caller's to hear, so they stay on
+        # one span -- but the total stops being a single opaque number that
+        # reads as the answer's own duration.
+        # marker:r12-filler-before-answer
+        if (source == "generate_reply" and state.reply_source == "say"
+                and state.tts is not None and not state.tts.ended):
+            spoken = state.tts_response.get("audio_ms")
+            state.tts_response["reply_includes_filler"] = True
+            if spoken:
+                state.tts_response["filler_audio_ms"] = spoken
+            state.tts_response["filler_audio_bytes"] = state.audio_bytes
         self._turns[speech_id] = state
         state.speech_handle = getattr(event, "speech_handle", None)
         state.reply_source = source
@@ -2236,10 +2357,52 @@ class VaaniLiveKitRecorder:
             model=self._model_for("stt", metrics),
             streamed=getattr(metrics, "streamed", None),
         )
-        self._pending_stt.metrics = {
-            "audio_ms": _ms(getattr(metrics, "audio_duration", None)),
+        # The meter reports *increments*, not a running total: Deepgram flushes
+        # one every five seconds and a remainder on close
+        # (plugins/deepgram/stt.py:484), and LiveKit forwards each separately
+        # (agents/stt/stt.py:513). Replacing the pending value published only
+        # the last tick, so a nine-second stretch was billed as four -- a
+        # provider's own billing number, silently understated.
+        metered = _ms(getattr(metrics, "audio_duration", None))
+        tokens = _present(
+            input_tokens=_int_or_none(getattr(metrics, "input_tokens", None)),
+            output_tokens=_int_or_none(getattr(metrics, "output_tokens", None)),
+        )
+        # Not every recogniser meters while the caller is speaking. OpenAI
+        # queues the final transcript first and the usage for it second
+        # (plugins/openai/stt.py:895), so the metric arrives after
+        # `_close_user_turn` has already swapped in a fresh pending span. Adding
+        # it there billed one caller's speech to the next one to talk, which is
+        # worse than not billing it at all: it is wrong in a direction nothing
+        # downstream can detect. If nobody has spoken on the pending span yet,
+        # the usage belongs to the turn that just closed.
+        # marker:r12-usage-after-final
+        pending = self._pending_stt
+        untouched = (pending.started_at_ms is None
+                     and pending.first_partial_at_ms is None
+                     and pending.ended_at_ms is None
+                     and not pending.partials
+                     and not pending.metrics)
+        carry = self._last_closed_stt_turn
+        if untouched and carry is not None and carry.stt is not None and not carry.stt.ended:
+            response = carry.stt_response
+            if metered is not None:
+                response["provider_metered_audio_ms"] = (
+                    (response.get("provider_metered_audio_ms") or 0) + metered
+                )
+            for key, value in tokens.items():
+                response[key] = (response.get(key) or 0) + value
+            # The turn it landed on is not the turn it was measured against.
+            response["metered_after_final"] = True
+            return
+        carried = (pending.metrics or {}).get("audio_ms")
+        merged: Dict[str, Any] = {
+            "audio_ms": carried if metered is None else (carried or 0) + metered,
             **self._stt_identity,
         }
+        for key, value in tokens.items():
+            merged[key] = ((pending.metrics or {}).get(key) or 0) + value
+        pending.metrics = merged
 
     def _record_eou(self, metrics: Any) -> None:
         # User-scoped: an end-of-utterance measurement describes the caller's
@@ -2275,7 +2438,14 @@ class VaaniLiveKitRecorder:
                 state, resolved_exactly = self._reply_turn(
                     (getattr(item, "text_content", None) or "").strip())
         else:
-            state, resolved_exactly = self._current_turn, True
+            # The caller's message belongs to the turn that was collecting it,
+            # not to whichever turn happens to be current: a `say()` spoken
+            # between the last final and the commit makes its own turn current,
+            # and routing the commit there left the caller's turn still
+            # collecting -- so their *next* message was merged into it.
+            # marker:r12-commit-to-collector
+            state = self._collecting_turn or self._current_turn
+            resolved_exactly = True
         if state is None:
             return
         metrics = getattr(item, "metrics", None) or {}
@@ -2452,7 +2622,21 @@ class VaaniLiveKitRecorder:
         state = self._speaking_turn
         if state is not None and not state.finished:
             prior = self._retired_reply
-            if (not state.audio_bytes
+            # A filler that spoke last is a *candidate*, not the answer. It was
+            # handed its own script by whoever called `say()`, so when a
+            # generated reply is still waiting for its words the two are equally
+            # plausible owners and the text has to decide -- seen live as one
+            # sentence captioning two turns, the shorter of which had only said
+            # "let me check that for you".
+            # marker:r12-filler-not-the-speaker
+            filler_over_answer = (
+                state.reply_source == "say"
+                and prior is not None
+                and prior is not state
+                and prior.reply_source == "generate_reply"
+                and not prior.tts_response.get("text")
+            )
+            if ((not state.audio_bytes or filler_over_answer)
                     and prior is not None
                     and prior is not state
                     and prior.audio_bytes
@@ -3444,9 +3628,12 @@ def observe_agent_session(
     recorder = recorder or VaaniLiveKitRecorder.from_env(**options)
     recorder.attach(session)
     if agent is not None:
-        agent.vaani = recorder
-        recorder.note_audio_tap_installed(agent)
-        recorder.watch_agent(agent)
+        recorder.bind_agent(agent)
+        # LiveKit supports replacing the agent mid-session
+        # (agent_session.py:1592). A replacement gets neither the audio tap nor
+        # the turn watch, so the rest of the call would record no agent audio
+        # and silently merge any utterance the new agent ignores.
+        _watch_handoff(session, recorder)
     elif recorder.enabled:
         # Audio is the single most expensive thing to lose and the easiest to
         # forget, because nothing else about the recording looks wrong.
@@ -3476,6 +3663,49 @@ def observe_agent_session(
 
             add(_finish_at_shutdown)
     return recorder
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    """Token counts only, and only when the provider really reported one."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value) or None
+
+
+def _is_stop_response(exc: BaseException) -> bool:
+    """LiveKit's "ignore this utterance" signal, matched the way LiveKit does.
+
+    By name, so the SDK keeps working against a build that moves the class, and
+    across the whole MRO, because LiveKit catches it by inheritance
+    (agent_activity.py:2487) -- an agent that subclasses it to carry a reason
+    would otherwise be recorded as an unexplained silence.
+    """
+    return any(base.__name__ == "StopResponse" for base in type(exc).__mro__)
+
+
+def _watch_handoff(session: Any, recorder: "VaaniLiveKitRecorder") -> None:
+    """Follow `AgentSession.update_agent()` so a replacement is instrumented."""
+    original = getattr(session, "update_agent", None)
+    if original is None or getattr(original, "_vaani_handoff", None) is recorder:
+        return
+
+    def update_agent(agent: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            recorder.bind_agent(agent)
+        except Exception as error:  # noqa: BLE001 - instrumentation is best effort
+            recorder._warn_once(
+                "handoff", "could not instrument the replacement agent (%s)", error)
+        return original(agent, *args, **kwargs)
+
+    update_agent._vaani_handoff = recorder  # type: ignore[attr-defined]
+    try:
+        session.update_agent = update_agent
+    except Exception:
+        recorder._warn_once(
+            "no-handoff",
+            "could not follow update_agent(); an agent handed off mid-call is "
+            "not instrumented and its audio is not captured",
+        )
 
 
 # --------------------------------------------------------------- small helpers

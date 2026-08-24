@@ -22,22 +22,31 @@ latency against a turn that contained no question, while the question itself
 read as unanswered. One exchange described wrongly twice, with the cost on the
 wrong side of it, under a caveat that admitted the doubt without resolving it.
 
-LiveKit does distinguish them, just not at the moment the SDK first hears about
-the reply, and not through a single field. There are four ways a reply is
-created and three of them say who they are for: the automatic answer to a
-completed user turn is scheduled in the same synchronous frame that created it,
-reports `user_initiated` and carries audio input details; preemptive generation
+LiveKit distinguishes most of them, just not at the moment the SDK first hears
+about the reply, and not through a single field. Preemptive generation
 deliberately is not scheduled, and stays that way until the predicted turn is
-validated; a realtime model's server-side generation is scheduled at once but is
-not `user_initiated`, and it answers the speech still being transcribed — that
-provider may withhold the final transcript until its reply exists, so the reply
-legitimately precedes the words that prompted it.
+validated. A realtime model's server-side generation is scheduled at once but is
+not `user_initiated` — that provider may withhold the final transcript until its
+reply exists, so the reply legitimately precedes the words that prompted it.
+Everything else is scheduled and `user_initiated`.
+
+Two routes emit an event identical in *every* field to the automatic answer, so
+they are settled by what the recorder observed rather than by what the event
+says. A reply your own code asked for is recognised because the call is still on
+the stack: `AgentSession.generate_reply()` reaches `speech_created` synchronously
+(`agent_session.py:1508-1520`), so counting entries to that method identifies its
+own replies whatever `input_modality` it was given. And `user_initiated=False`
+covers both a realtime reply to speech being transcribed now *and* the automatic
+reply after a tool result, which answers the turn that ran the tool; those are
+told apart by whether the current turn has a tool result still owed a reply,
+which LiveKit publishes as `function_tools_executed` before the reply is
+generated (`agent_activity.py:4242`, ahead of `:4273`).
 
 The decision now waits the one event-loop iteration that scheduling takes and
-then reads all three signals. Automatic answers join the turn they answer.
-Preemptive and realtime replies keep their own turn, which the caller's final
-transcript then joins, so a caller's words are never reported as answered before
-they were spoken.
+then reads every available signal. Automatic answers and post-tool replies join
+the turn they answer. Preemptive and realtime replies keep their own turn, which
+the caller's final transcript then joins, so a caller's words are never reported
+as answered before they were spoken.
 
 Scheduling alone is not enough, and reading it alone was itself a defect caught
 before release: it is queue state, not provenance. A realtime reply is queued
@@ -52,17 +61,17 @@ waiting on the loop alone would have made attribution depend on arrival order,
 and an operation already written cannot be moved.
 
 Verified against real `SpeechHandle` and `SpeechCreatedEvent` objects on
-livekit-agents 1.7.0, and against 1.6.10 source, in all four directions.
+livekit-agents 1.7.0, and against 1.6.10 source, in all six directions.
 
 ### The attribution caveat now means what it says
 
 `reply_attribution: "inferred"` was published for every reply that followed a
 filler. It is now recorded only where the ownership genuinely cannot be read:
-a reply your own code asked for with `AgentSession.generate_reply()`, which is
-indistinguishable from the automatic answer except that its input modality
-defaults to text — and which may be answering the caller or saying something
-unrelated. Builds too old to report these signals also keep the caveat, rather
-than being merged on an assumption. A caveat that appears on correct data
+a reply your own code asked for with `AgentSession.generate_reply()`, which may
+be answering the caller or saying something unrelated; and a realtime reply
+placed on the turn whose tool result it is owed to, where a caller talking over
+the tool call could have prompted it instead. Builds too old to report these
+signals also keep the caveat, rather than being merged on an assumption. A caveat that appears on correct data
 teaches adopters to ignore it; one that disappears on a guess is worse.
 
 Derived LLM spans — reconstructed from `conversation_item_added` when no plugin

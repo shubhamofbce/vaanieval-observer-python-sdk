@@ -40,6 +40,7 @@ Known limits of what LiveKit exposes:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 from typing import Any, Dict, List, Mapping, Optional
@@ -1250,6 +1251,80 @@ class VaaniLiveKitRecorder:
         """Record one caller PCM frame. Called from `Agent.stt_node`."""
         self._tap(frame, inbound=True)
 
+    def watch_agent(self, agent: Any) -> None:
+        """Learn when LiveKit ends a user turn, including turns it never commits.
+
+        `conversation_item_added` is the only public event announcing a
+        committed user message, and LiveKit ends turns it never commits: an
+        agent that raises `StopResponse` from `on_user_turn_completed` to ignore
+        an utterance leaves the framework with the turn already closed and its
+        transcript cleared (`agent_activity.py:2487`, and `on_end_of_turn` has
+        by then returned `True`, so `audio_recognition.py` clears the accumulated
+        text). Without this hook the next utterance looks like a continuation of
+        the ignored one and is recorded prepended to it: one turn where the
+        framework had two, carrying another caller's words.
+
+        `on_user_turn_completed` is a documented `Agent` method called on
+        exactly that path, so wrapping it is the signal. The wrapper is
+        transparent -- the agent's own return value and exceptions pass through
+        untouched, and bookkeeping failures are swallowed rather than breaking
+        the call.
+        """
+        original = getattr(agent, "on_user_turn_completed", None)
+        if original is None or getattr(original, "_vaani_watch", False):
+            return
+
+        async def _on_user_turn_completed(turn_ctx: Any, new_message: Any) -> Any:
+            self._bookkeep("user-turn-ended", self._note_user_turn_ended)
+            try:
+                result = original(turn_ctx, new_message)
+                return await result if inspect.isawaitable(result) else result
+            except BaseException as exc:
+                # `StopResponse` is how an agent says "ignore this utterance".
+                # Matched by name so the SDK keeps working against a LiveKit
+                # build that moves it, and re-raised either way.
+                if type(exc).__name__ == "StopResponse":
+                    self._bookkeep("user-turn-dropped", self._note_user_turn_dropped)
+                raise
+
+        _on_user_turn_completed._vaani_watch = True  # type: ignore[attr-defined]
+        try:
+            agent.on_user_turn_completed = _on_user_turn_completed
+        except Exception:
+            # A frozen or slotted Agent subclass. The recording stays correct
+            # for every committed turn; only the ignored-utterance case is
+            # unobservable, so say so once rather than fail the call.
+            self._warn_once(
+                "no-turn-watch",
+                "could not observe on_user_turn_completed; an utterance the agent "
+                "ignores with StopResponse may be recorded with the next one",
+            )
+
+    def _bookkeep(self, name: str, note: Any) -> None:
+        """Record something learned from application code, best effort.
+
+        Same policy as the event handlers: inert once the call is released, and
+        a failure here must never propagate into the agent's own method.
+        """
+        if self.call is None:
+            return
+        try:
+            note()
+        except Exception as error:  # noqa: BLE001 - recording is best effort
+            self._warn_once(f"handler:{name}", "handler %s failed (%s)", name, error)
+
+    def _note_user_turn_ended(self) -> None:
+        """LiveKit closed the caller's message, whether or not it answers it."""
+        carry = self._collecting_turn
+        if carry is not None:
+            carry.user_committed = True
+
+    def _note_user_turn_dropped(self) -> None:
+        """The agent ignored this utterance, so no reply is coming for it."""
+        carry = self._collecting_turn
+        if carry is not None and carry.stt is not None:
+            carry.stt_response["reply_skipped"] = "stop_response"
+
     def note_audio_tap_installed(self, agent: Any = None) -> None:
         """Record that this recorder is positioned to measure the agent.
 
@@ -1459,6 +1534,10 @@ class VaaniLiveKitRecorder:
         if (carry is not None
                 and not carry.user_committed
                 and carry.stt is not None
+                # An extension writes into the open span. Once it is closed the
+                # words are already published, so merging there would drop them
+                # -- silently, and it is the caller's transcript.
+                and not carry.stt.ended
                 and self._preemptive_turn is None
                 and _is_unanswered_turn(carry)):
             self._extend_user_turn(carry, text, at, pending, reason)
@@ -1513,7 +1592,13 @@ class VaaniLiveKitRecorder:
             if self._capture_transcripts
             else {"char_count": len(text), "final_reason": reason}
         )
-        response["audio_ms"] = pending.metrics.get("audio_ms")
+        # Not this turn's audio. The recogniser meters the websocket on a fixed
+        # timer -- Deepgram reports every 5s of streamed audio plus the
+        # connection remainder on close -- so a tick lands on whichever turn is
+        # open and covers silence between turns too. Published under a name that
+        # says so: as `audio_ms` it read as speech duration and a real merged
+        # turn showed 5000ms of "audio" on a 2975ms span.
+        response["provider_metered_audio_ms"] = pending.metrics.get("audio_ms")
         state.stt = operation
         state.stt_response = response
         state.stt_ended_at = at
@@ -1545,11 +1630,14 @@ class VaaniLiveKitRecorder:
         else:
             response["char_count"] = (response.get("char_count") or 0) + len(text)
         response["final_reason"] = reason
-        # Both denominators are summed rather than replaced: the caller spoke
-        # for the total of the segments, not for the last one.
-        audio_ms = pending.metrics.get("audio_ms")
-        if audio_ms is not None:
-            response["audio_ms"] = (response.get("audio_ms") or 0) + audio_ms
+        # The caller's characters are summed because each segment carries its
+        # own. The metered audio is summed because it is a running meter, and a
+        # turn that stayed open across two ticks really was charged for both.
+        metered = pending.metrics.get("audio_ms")
+        if metered is not None:
+            response["provider_metered_audio_ms"] = (
+                (response.get("provider_metered_audio_ms") or 0) + metered
+            )
         response["final_segments"] = int(response.get("final_segments") or 1) + 1
         state.stt_ended_at = at
         self._pending_stt = _PendingStt()
@@ -1589,10 +1677,17 @@ class VaaniLiveKitRecorder:
             # so it belongs to the turn already collecting it -- otherwise the
             # reply lands in a turn of its own and the caller's words sit in
             # one that looks unanswered.
+            # Only a generated reply, for the same reason as the preemptive
+            # branch below: `say()` is spoken *at* the caller, not in answer to
+            # them. Adopting a filler said while the caller is still talking
+            # would bill its audio to their unfinished message and, worse, leave
+            # that message no longer collecting -- so the rest of what they said
+            # would be recorded as a second turn, answered by the reply to the
+            # first half.
             # marker:r11-supersede
             carry = self._collecting_turn
             if (carry is not None
-                    and not carry.user_committed
+                    and source == "generate_reply"
                     and carry.stt is not None
                     and _is_unanswered_turn(carry)):
                 state = carry
@@ -2188,13 +2283,11 @@ class VaaniLiveKitRecorder:
         if role == "user":
             # LiveKit has committed the caller's message: whatever it says next
             # opens a new turn rather than extending this one.
-            # Marking the turn is what closes collection; the reference is
-            # released with it. A superseding speech always adopts the turn
-            # still collecting, so the current turn *is* that turn here --
-            # marking the collecting turn separately was unreachable and is
-            # deliberately not carried as a branch nothing can execute.
+            # Marking the turn is what closes collection. The reference itself
+            # is kept: the reply LiveKit generates for this message can be
+            # created either side of this event, and dropping the reference here
+            # made adoption depend on that ordering. The next final replaces it.
             state.user_committed = True
-            self._collecting_turn = None
             if state.stt is not None and not state.stt.ended:
                 state.stt.event(
                     "turn_report",
@@ -3353,6 +3446,7 @@ def observe_agent_session(
     if agent is not None:
         agent.vaani = recorder
         recorder.note_audio_tap_installed(agent)
+        recorder.watch_agent(agent)
     elif recorder.enabled:
         # Audio is the single most expensive thing to lose and the easiest to
         # forget, because nothing else about the recording looks wrong.

@@ -5995,3 +5995,211 @@ async def test_an_override_that_reaches_past_the_emitter_is_not_the_last_answer(
         "the reply was separated on a guess, and a reader deciding a latency "
         "from it is owed that"
     )
+
+
+@pytest.mark.asyncio
+async def test_a_decorated_override_is_not_read_as_livekits_own_answer(
+        recorder, public_generate_reply):
+    """A decorator's frame is named for the decorator, not for the method.
+
+    `functools.wraps` copies `__name__`; it does not touch `co_name`, which is
+    what a stack frame carries. So a tracing decorator around an overridden
+    `generate_reply` leaves a frame called `wrapper`, and if the override
+    reaches a different protected path there is no base code object and no
+    emitting frame either. Every anchor is absent, which is exactly what
+    LiveKit's automatic answer looks like -- and reading it as one merged the
+    application's reply backwards into the previous caller's turn, silently,
+    with `coverage_complete` still true.
+
+    Nothing matching is not evidence. The automatic answer always leaves the
+    emitting frame on the stack, so its absence rules that reading out.
+    """
+    import functools
+
+    rec = recorder()
+
+    def traced(method):
+        @functools.wraps(method)
+        def wrapper(self, **kwargs):
+            handle_id = kwargs.pop("handle_id", "traced-reply")
+            self.emit("speech_created",
+                      speech_created(FakeSpeechHandle(handle_id)))
+        return wrapper
+
+    class DecoratedSession(FakeAgentSession):
+        @traced
+        def generate_reply(self, **kwargs):  # pragma: no cover - replaced
+            raise AssertionError("the wrapper stands in for this method")
+
+    assert DecoratedSession.generate_reply.__name__ == "generate_reply"
+    assert DecoratedSession.generate_reply.__code__.co_name == "wrapper", (
+        "guard: this test is meaningless unless the decorator hides the name"
+    )
+    session = DecoratedSession()
+    rec.attach(session)
+    rec.note_audio_tap_installed()
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("What is the fare?", True))
+    session.emit("conversation_item_added", chat_item("user", "What is the fare?"))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("filler-1"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("And to Boston?", False))
+    session.generate_reply(handle_id="traced-reply")
+    session.emit("metrics_collected", llm_metrics("traced-reply"))
+    await rec.finish()
+
+    ops = operations(read_events(_dir(rec)))
+    llm = next(op for op in ops if op["type"] == "llm")
+    asked = next(op for op in ops if op["type"] == "stt"
+                 and "fare" in (op["response"].get("transcript") or ""))
+    assert llm["turn_id"] != asked["turn_id"], (
+        "a reply whose anchors were all hidden by a decorator was merged into "
+        "the previous caller's turn, charging them for tokens they never "
+        "prompted -- and nothing in the package says so"
+    )
+    assert llm["response"].get("reply_attribution") == "inferred", (
+        "the separation is a judgement and has to be disclosed as one"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_compatible_sessions_own_call_is_not_livekits_automatic_answer(
+        recorder):
+    """`attach()` accepts anything shaped like an `AgentSession`.
+
+    When `livekit.agents` does not import there is no code object to match and
+    no framework that could have generated anything -- so the walk was skipped
+    and every reply was read as LiveKit's automatic answer to whoever spoke
+    last. For a vendored or compatible session that is exactly backwards: the
+    only replies it can produce are the application's, and they were the ones
+    being merged away.
+
+    The session's own `generate_reply` frame is all the evidence there is here,
+    so the reply is disclosed rather than asserted.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    rec.note_audio_tap_installed()
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("What is the fare?", True))
+    session.emit("conversation_item_added", chat_item("user", "What is the fare?"))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("filler-1"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("And to Boston?", False))
+    session.generate_reply(handle_id="duck-reply")
+    session.emit("metrics_collected", llm_metrics("duck-reply"))
+    await rec.finish()
+
+    ops = operations(read_events(_dir(rec)))
+    llm = next(op for op in ops if op["type"] == "llm")
+    asked = next(op for op in ops if op["type"] == "stt"
+                 and "fare" in (op["response"].get("transcript") or ""))
+    assert llm["turn_id"] != asked["turn_id"], (
+        "a compatible session's own application reply was merged into the "
+        "previous caller's turn as though LiveKit had generated it"
+    )
+    assert llm["response"].get("reply_attribution") == "inferred"
+    reason = llm["response"].get("reply_attribution_reason") or ""
+    assert "standing in for" not in reason, (
+        "nothing stood in for anything here -- the session's own public "
+        "method ran, and describing it as a replacement sends an operator "
+        "looking for instrumentation that does not exist"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_stack_says_so_instead_of_naming_a_likely_cause(
+        recorder, monkeypatch):
+    """A confident explanation of an unknown is worse than no explanation.
+
+    The generic caveat asserts that the reply "was not the automatic answer"
+    and is "most likely an application call to generate_reply()". An unreadable
+    stack establishes neither. Where the truth is the ordinary automatic
+    answer, the conservative placement is already wrong -- and the one field an
+    operator has for resolving it was telling them not to consider the correct
+    explanation.
+    """
+    monkeypatch.setattr(livekit_integration, "_GENERATE_REPLY_CODE",
+                        livekit_integration._CALL_SITE_UNAVAILABLE)
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    rec.note_audio_tap_installed()
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("What is the fare?", True))
+    session.emit("conversation_item_added", chat_item("user", "What is the fare?"))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("filler-1"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("And to Boston?", False))
+    session.emit("speech_created", speech_created(FakeSpeechHandle("reply-1")))
+    session.emit("metrics_collected", llm_metrics("reply-1"))
+    await rec.finish()
+
+    llm = next(op for op in operations(read_events(_dir(rec)))
+               if op["type"] == "llm")
+    reason = llm["response"].get("reply_attribution_reason") or ""
+    assert "could not be read at all" in reason, (
+        "the caveat does not say the stack could not be read, which is the "
+        "only fact established about this reply"
+    )
+    assert "most likely an application call" not in reason, (
+        "the caveat asserts a cause that an unreadable stack cannot establish"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_post_tool_reply_caveat_describes_the_route_it_took(recorder):
+    """A caveat has to describe the reply it is attached to.
+
+    The post-tool realtime generation is merged into the turn that ran the
+    tool. It was published with the generic text, which says the reply was not
+    a realtime server generation, was most likely an application call, and was
+    kept in its own turn rather than merged -- three statements, all false for
+    this route. The placement is honestly marked `inferred`, so the field meant
+    to let an operator resolve the ambiguity was the only thing lying.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    rec.note_audio_tap_installed()
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("book it", True))
+    session.emit("conversation_item_added", chat_item("user", "book it"))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("filler-1"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    session.emit("function_tools_executed", tools_executed())
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("hello?", False))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("tool-answer"),
+                                user_initiated=False))
+    session.emit("metrics_collected", llm_metrics("tool-answer"))
+    await rec.finish()
+
+    ops = operations(read_events(_dir(rec)))
+    llm = next(op for op in ops if op["type"] == "llm")
+    asked = next(op for op in ops if op["type"] == "stt"
+                 and "book it" in (op["response"].get("transcript") or ""))
+    assert llm["turn_id"] == asked["turn_id"], (
+        "guard: this test is meaningless unless the reply was merged into the "
+        "turn that ran the tool"
+    )
+    reason = llm["response"].get("reply_attribution_reason") or ""
+    assert "still owed an answer" in reason and "merged into the turn" in reason, (
+        "the caveat does not describe the post-tool route this reply took"
+    )
+    assert "most likely an application call" not in reason, (
+        "the caveat describes a different route and the opposite placement"
+    )

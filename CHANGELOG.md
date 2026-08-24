@@ -4,6 +4,42 @@ Every recorded package stamps its SDK version into the manifest, so the version
 here is what a bug report is tied back to. Entries describe what changed about
 *the data* — a fix that alters no recorded value is not worth an adopter's time.
 
+## 0.5.5
+
+A thirteenth pass, aimed at the fix `0.5.4` shipped. It found the mirror image
+of the bug that release repaired: the anchor was now trusted where it could not
+be found, and two of the three new caveats described a route the reply had not
+taken.
+
+**A decorated `generate_reply()` was still merged into someone else's turn.**
+`0.5.4` recognised a replaced public method by looking for a stand-in frame
+named `generate_reply`. `functools.wraps` copies a function's *name* but not its
+code object, so a traced or decorated override leaves a frame literally called
+`wrapper` — the check missed it — and if the override reached a different
+internal path, neither anchor was on the stack either. The reply fell through to
+the automatic reading and was merged backwards into the previous caller's turn,
+with `status: ok` and no flag. The rule is now stated the other way round:
+LiveKit's automatic answer is emitted synchronously from inside
+`AgentActivity._generate_reply()`, so that frame is present every time it is
+created, and its **absence rules the automatic answer out**. Nothing has to
+recognise the wrapper. Scoped to replies whose event names `generate_reply` as
+the source, because `say()` legitimately emits from elsewhere and must still
+merge.
+
+**A session that was not LiveKit's was read as LiveKit.** `attach()` accepts any
+compatible session, and on a machine where `livekit.agents` cannot be imported
+the stack walk was skipped outright — so an application's own call to its own
+session's `generate_reply()` was recorded as LiveKit's automatic answer to the
+previous caller. The walk now runs regardless; a `generate_reply` frame whose
+receiver *is* the recorded session is the only evidence available and is read as
+an application call, which keeps the reply in its own turn under a flag.
+
+**Two caveats named the wrong cause.** A reply placed because the stack could
+not be read was described as "most likely an application call to
+`generate_reply()`", and a post-tool realtime reply — which is *merged into* the
+turn that ran the tool — was described as having been "kept in its own turn".
+Both now state the route actually taken.
+
 ## 0.5.4
 
 A twelfth review pass, aimed at the anchor the eleventh release rests on. It

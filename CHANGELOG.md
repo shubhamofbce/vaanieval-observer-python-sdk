@@ -4,6 +4,57 @@ Every recorded package stamps its SDK version into the manifest, so the version
 here is what a bug report is tied back to. Entries describe what changed about
 *the data* — a fix that alters no recorded value is not worth an adopter's time.
 
+## 0.5.0
+
+A sixth review pass over the 0.4.0 fixes, which found four further defects of
+the same silent kind. One field changed meaning, hence the minor bump.
+
+### A spoken sentence could be dropped from the transcript
+
+The recorder de-duplicated assistant messages by asking whether the new text was
+*contained in* what it had already recorded. So a filler of "The fare is ready"
+followed by an answer of "fare" discarded the answer: 21 characters spoken, 17
+recorded, and `char_count` short by the same amount with nothing to indicate it.
+Containment is not identity, and even identical text can legitimately be said
+twice. De-duplication is now keyed on the LiveKit `ChatItem.id`, which is unique
+per delivered item. A test that had asserted the truncated count — blessing the
+defect — was corrected.
+
+### The volume chart disagreed with the KPI directly above it
+
+When one caller's utterance was split across two turns, the KPI counted the pair
+as one turn and the timeseries counted it as two. A range landing on the split
+boundary could show a KPI of 0 above a chart bar of 1. The chart now applies the
+same rule the KPI does. Latency, failures and lag stay per-span, because those
+are measured rather than counted.
+
+### `metering_scope` asserted billing semantics it could not know
+
+**Breaking.** 0.4.0 inferred, from whether a provider's usage report arrived
+before or after the final transcript, whether it metered one utterance or the
+whole connection. That inference is wrong for both providers we checked against
+their source: OpenAI emits a genuine *per-utterance* meter after the final,
+which we labelled `connection`; Deepgram ticks a *connection-wide* 5-second
+collector that routinely fires before the final, which we labelled `utterance`.
+
+`metering_scope` is now always `"unknown"`. What is actually observable is
+published as `metered_arrival` (`before_final`, `after_final` or
+`straddles_final`), and `metering_scope_note` states the caveat on the payload
+itself, so it travels with the number rather than living only in these docs.
+**If you read `metering_scope`, you must stop.**
+
+### A reply detached from its turn without saying so
+
+If a partial transcript arrives while a filler is playing, the reply that
+follows is kept in a turn of its own. That is the safe choice — merging would
+show a caller answered before they spoke — but it is a *guess*: LiveKit reports
+a preflight transcript from a second speaker and an ordinary interim from the
+current one through the same event, and preemptive generation is on by default,
+so both really occur. The span now carries `reply_attribution: "inferred"` and a
+`reply_attribution_reason` naming exactly what could not be distinguished. This
+ambiguity is inherent to the LiveKit event surface; it is now disclosed, not
+resolved.
+
 ## 0.4.0
 
 The whole of this release answers an external audit of the LiveKit integration

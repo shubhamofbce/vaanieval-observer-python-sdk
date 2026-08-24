@@ -266,7 +266,7 @@ class _TurnState:
                  "tts_response", "tts_ended_at", "tools", "audio_bytes",
                  "audio_first_at_ms", "finished", "tts_derived", "tts_ttfa_ms",
                  "reply_complete", "tts_text", "tts_reconstructed", "speech_handle",
-                 "reply_source", "filler_speech_id",
+                 "reply_source", "filler_speech_id", "recorded_item_ids",
                  "open_streams", "awaiting_stream_close", "unscoped_audio_bytes",
                 "unscoped_audio_bytes_at_publish", "publication_snapshot_taken",
                  "seq", "finished_at_seq",
@@ -328,6 +328,12 @@ class _TurnState:
         self.speech_handle: Any = None
         # The `say()` whose audio shares this span with a generated answer.
         self.filler_speech_id: Optional[str] = None
+        # Assistant items already folded into this span's text and char_count.
+        # LiveKit gives every chat item a unique id, so this is exact: it
+        # answers "have I recorded this utterance" without having to guess
+        # from the words, which cannot distinguish a redelivery from a second
+        # thing the agent genuinely said.
+        self.recorded_item_ids: set = set()
         # How LiveKit created this turn's reply, or `None` while it has no
         # reply at all. Decides which provider stages this turn could ever be
         # the claimant for.
@@ -370,35 +376,55 @@ class _TurnState:
 
 
 def _set_metering_scope(response: Dict[str, Any]) -> None:
-    """Say what the published meter is a measurement *of*.
+    """Say *when* the meter arrived. Refuse to say what it is a measurement of.
 
     `provider_metered_audio_ms` is whatever the recogniser billed against this
     turn, and two recognisers mean two different things by it. An
-    utterance-metering one (OpenAI) reports the caller's speech. A
-    connection-metering one (Deepgram, flushing every five seconds off frames
-    streamed) reports wall-clock on an open socket, silence included -- and on
-    a live four-turn call three turns had *the entire* published meter arrive
-    after the caller had already stopped talking. Read as speech duration that
-    is not slightly wrong, it is unrelated.
+    utterance-metering one reports the caller's speech; a connection-metering
+    one reports wall-clock on an open socket, silence included. Read as speech
+    duration, the second is not slightly wrong -- it is unrelated.
 
-    Publishing `metered_after_final_ms` beside it made the ambiguity visible but
-    left every consumer to rediscover the convention and do the subtraction. So
-    the classification is published too. The amount is never altered: a
-    connection meter is still the number the provider will invoice.
+    An earlier version of this function inferred which of the two you had from
+    the arrival time of the meter relative to the final transcript, and
+    published the answer as `metering_scope`. That inference is wrong in both
+    directions against the plugins people actually run:
+
+    * OpenAI sends the item's `FINAL_TRANSCRIPT` and *then* that same item's
+      `RECOGNITION_USAGE`, whose `audio_duration` it computes from the item's
+      own start and end. A true per-utterance meter, arriving entirely after
+      the final, which the timing rule labelled `connection`.
+    * Deepgram pushes every streamed frame into a five-second
+      `PeriodicCollector` and emits each tick as usage. A tick that happens to
+      land mid-speech is connection-scoped audio the timing rule labelled
+      `utterance`.
+
+    So the scope is not knowable from timing, and guessing it produced exactly
+    the failure this project exists to prevent: a confident label, invisibly
+    wrong, on a number someone bills from. What *is* knowable is when the meter
+    arrived, and that is published as an observation about arrival -- named so
+    it cannot be read as a claim about semantics. Deciding cost per turn from it
+    still needs the provider's own metering rule, which the SDK does not have.
     """
     total = response.get("provider_metered_audio_ms")
     if not total:
         return
     after = response.get("metered_after_final_ms") or 0
     if after <= 0:
-        # Everything was metered while the caller was still speaking.
-        scope = "utterance"
+        arrival = "before_final"
     elif after >= total:
-        # Nothing in the meter can be tied to this turn's speech.
-        scope = "connection"
+        arrival = "after_final"
     else:
-        scope = "mixed"
-    response["metering_scope"] = scope
+        arrival = "straddles_final"
+    response["metered_arrival"] = arrival
+    # Stated in the payload rather than left to documentation, because the
+    # number travels into spreadsheets and alert thresholds without it.
+    response["metering_scope"] = "unknown"
+    response["metering_scope_note"] = (
+        "Arrival time does not identify the provider's metering rule: a "
+        "per-utterance meter can arrive after the final transcript, and a "
+        "connection meter can tick before it. Use the provider's own billing "
+        "definition to interpret provider_metered_audio_ms."
+    )
 
 
 def _is_unanswered_turn(state: "_TurnState", allow_filler: bool = True) -> bool:
@@ -598,6 +624,9 @@ class VaaniLiveKitRecorder:
         # True once any stream had to be bound by timing because LiveKit's
         # speech-handle context was unavailable.
         self._stream_ownership_inferred: bool = False
+        # Set when a reply was kept out of a filler-only turn on evidence that
+        # cannot distinguish the next caller from the current one.
+        self._reply_attribution_contested: bool = False
         self._tail_written_off_ms: int = 0
         self._tail_written_off_turns: List[str] = []
 
@@ -1848,22 +1877,29 @@ class VaaniLiveKitRecorder:
             # would be recorded as a second turn, answered by the reply to the
             # first half.
             carry = self._collecting_turn
-            if (carry is not None
-                    and source == "generate_reply"
-                    and carry.stt is not None
-                    and _is_unanswered_turn(
-                        carry,
-                        # Not `started_at_ms`: any VAD interval sets that
-                        # (agent_activity.py:2082), including a cough while the
-                        # callback that issued the filler is still awaiting. The
-                        # old caller's answer is created *after* that callback
-                        # returns, so a VAD-only gate refused the very adoption
-                        # this term exists to allow. A preemptive reply is
-                        # generated from a *transcript*, never from VAD alone,
-                        # so a partial is what marks a genuine next caller.
-                        allow_filler=(
-                            self._pending_stt.first_partial_at_ms is None))):
+            adoptable = (carry is not None
+                         and source == "generate_reply"
+                         and carry.stt is not None)
+            # Whether this reply belongs to the caller whose filler is playing,
+            # or to a *next* caller who spoke over it, is not decidable from the
+            # events LiveKit makes public. A preflight transcript and an
+            # ordinary interim both surface as
+            # `user_input_transcribed(is_final=False)` --
+            # `audio_recognition.py:1269` and `:1310` call the same hook -- and
+            # only preflight additionally starts a preemptive generation, which
+            # is not observable. Preemptive generation is on by default, so both
+            # readings are live and no gate can separate them.
+            #
+            # Refusing is the safer default: adopting a next caller's reply
+            # backwards merges two exchanges, so their words appear answered
+            # before they were spoken. Refusing keeps both exchanges present and
+            # separately inspectable. But it is a guess either way, so the turn
+            # that results says so instead of reading as a fact.
+            contested = adoptable and self._pending_stt.first_partial_at_ms is not None
+            if adoptable and _is_unanswered_turn(carry, allow_filler=not contested):
                 state = carry
+            elif contested:
+                self._reply_attribution_contested = True
         if (state is None
                 and source == "generate_reply"
                 and self._pending_stt.started_at_ms is not None):
@@ -1891,6 +1927,21 @@ class VaaniLiveKitRecorder:
             # speech at all.
             state = self._new_turn()
         self._pending_turn = None
+        if self._reply_attribution_contested:
+            # The reply was filed in a turn of its own because a partial arrived
+            # while a filler was playing, and LiveKit does not expose enough to
+            # tell whose partial it was. Recorded on the turn so a reader sees
+            # the uncertainty attached to the number, rather than a detached
+            # answer that reads as an established fact.
+            self._reply_attribution_contested = False
+            state.tts_response["reply_attribution"] = "inferred"
+            state.tts_response["reply_attribution_reason"] = (
+                "a partial transcript arrived while the previous turn's filler "
+                "was still playing. LiveKit reports a preflight transcript and "
+                "an ordinary interim as the same event, so this reply was kept "
+                "separate rather than merged into that turn; it may in fact "
+                "answer it"
+            )
         # A filler said *inside* `on_user_turn_completed` is spoken after the
         # caller's message is committed and before LiveKit generates the real
         # answer, so nothing at the time it is said can tell it from a scripted
@@ -2611,12 +2662,17 @@ class VaaniLiveKitRecorder:
                 # capture is off, understated by the same amount.
                 merge = bool(state.tts_response.get("reply_includes_filler"))
                 prior = state.tts_response.get("text") if self._capture_transcripts else None
-                # `text in prior` means this item has already been recorded --
-                # not that it replaces what is there. Falling through to a plain
-                # assignment discarded the filler's words whenever the answer
-                # happened to be a substring of them, which is the same silent
-                # loss this block was added to stop.
-                already = bool(merge and prior and text in prior)
+                # "Have I already recorded this utterance?" is a question about
+                # delivery identity, and LiveKit answers it exactly: every chat
+                # item carries its own id. Comparing words instead cannot tell a
+                # redelivery of one utterance from two the agent really spoke --
+                # a filler "The fare is ready" followed by an answer "fare"
+                # reads as containment, and the answer was silently dropped from
+                # both the transcript and `char_count`.
+                item_id = getattr(item, "id", None)
+                already = bool(item_id is not None and item_id in state.recorded_item_ids)
+                if item_id is not None:
+                    state.recorded_item_ids.add(item_id)
                 if self._capture_transcripts:
                     state.tts_response["text"] = (
                         f"{prior} {text}" if merge and prior and not already

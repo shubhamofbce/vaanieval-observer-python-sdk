@@ -4094,6 +4094,83 @@ async def test_a_finished_filler_turn_does_not_adopt_the_next_callers_reply(reco
     assert second_reply[0]["turn_id"] != first[0]["turn_id"], (
         "the second caller's reply was adopted into the first caller's turn"
     )
+    assert second_reply[0]["response"].get("reply_attribution") == "inferred", (
+        "keeping the reply separate here is a judgement call, not a proof, and "
+        "the span has to say which it is"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_reply_kept_out_of_a_filler_turn_admits_it_might_belong_there(recorder):
+    """The one thing this must never be is silent.
+
+    LiveKit reports a preflight transcript and an ordinary interim through the
+    same public event (`audio_recognition.py:1269` and `:1310` call the same
+    hook), and only preflight starts a preemptive generation -- which is not
+    observable at all. So when a partial arrives while a filler is playing,
+    "this reply belongs to the next caller" and "this reply answers the caller
+    whose filler is playing" are indistinguishable, and preemptive generation is
+    on by default, so both really happen.
+
+    The recorder keeps the reply separate, because merging two exchanges makes a
+    caller's words appear answered before they were spoken. But it is a guess,
+    and a reader deciding a latency from it is owed that.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("What is the fare?", True))
+    session.emit("conversation_item_added", chat_item("user", "What is the fare?"))
+    session.emit("speech_created",
+                 speech_created(SimpleNamespace(id="filler-1"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    # Someone speaks while the filler plays. Nothing here says who.
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("And to Boston?", False))
+    session.emit("speech_created", speech_created(SimpleNamespace(id="answer-2")))
+    session.emit("metrics_collected", tts_metrics("answer-2", audio_duration=2.0))
+    rec.tap_output_frame(agent_frame(2000))
+    await rec.finish()
+
+    tts = [op for op in operations(read_events(_dir(rec)))
+           if op["type"] == "tts" and op["response"].get("audio_ms") == 2000]
+    assert tts, "the reply must be recorded whichever turn it lands in"
+    response = tts[0]["response"]
+    assert response.get("reply_attribution") == "inferred"
+    assert "preflight" in (response.get("reply_attribution_reason") or ""), (
+        "the reason must name what could not be distinguished, so a reader can "
+        "judge it rather than take our word for it"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_uncontested_reply_is_not_labelled_a_guess(recorder):
+    """A caveat on every turn is a caveat nobody reads.
+
+    With no partial arriving during the filler there is nothing to be uncertain
+    about, and the span must not carry the disclosure.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("What is the fare?", True))
+    session.emit("conversation_item_added", chat_item("user", "What is the fare?"))
+    session.emit("speech_created",
+                 speech_created(SimpleNamespace(id="filler-1"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    session.emit("speech_created", speech_created(SimpleNamespace(id="answer-1")))
+    session.emit("metrics_collected", tts_metrics("answer-1", audio_duration=2.0))
+    rec.tap_output_frame(agent_frame(2000))
+    await rec.finish()
+
+    for op in operations(read_events(_dir(rec))):
+        assert "reply_attribution" not in op.get("response", {}), (
+            "nothing was contested, so nothing should be hedged"
+        )
 
 
 @pytest.mark.asyncio
@@ -4261,26 +4338,34 @@ async def test_post_final_metering_publishes_the_subtractable_amount(recorder):
     assert response.get("metered_after_final_ms") == 5000, (
         "without the amount, silence and speech are indistinguishable"
     )
-    # The whole meter arrived after the caller stopped, so nothing in it is a
-    # measurement of this turn's speech. Publishing the amount left every
-    # consumer to rediscover that; the classification says it outright.
-    assert response.get("metering_scope") == "connection"
+    # The whole meter arrived after the caller stopped. That is a fact about
+    # arrival and is recorded as one -- it is deliberately NOT read as evidence
+    # that the meter is connection-scoped, because OpenAI sends a true
+    # per-utterance meter in exactly this position.
+    assert response.get("metered_arrival") == "after_final"
+    assert response.get("metering_scope") == "unknown"
 
 
 @pytest.mark.asyncio
-async def test_a_meter_that_lands_during_speech_is_scoped_to_the_utterance(recorder):
-    """The caveat has to distinguish, or it is just a label on every turn.
+async def test_the_recorder_never_infers_billing_semantics_from_arrival_time(recorder):
+    """Timing cannot tell you what a provider's meter measures.
 
-    A recogniser that reports while the caller is still talking is measuring
-    that caller's speech, and its number is directly comparable to the audio we
-    recorded. Marking it the same way as a connection meter would throw away
-    the only billing figure on the payload that can be trusted turn by turn.
+    OpenAI emits an item's final transcript and then that same item's usage,
+    computed from the item's own start and end -- a per-utterance meter that
+    arrives entirely after the final. Deepgram pushes every streamed frame into
+    a five-second collector and emits each tick, so connection-scoped audio
+    routinely reports while the caller is still speaking. Any rule that reads
+    scope off arrival is therefore wrong in both directions, and wrong silently,
+    on a number people bill from.
+
+    So arrival is published as arrival, and scope says it does not know.
     """
     rec = recorder()
     session = FakeAgentSession()
     rec.attach(session)
     session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
-    # The meter fires while the utterance is still open.
+    # A meter landing mid-speech -- the shape Deepgram's five-second tick makes
+    # even though its meter is connection-scoped.
     session.emit("metrics_collected", stt_metrics(audio_duration=3.0))
     session.emit("user_input_transcribed", transcript("What is the fare?", True))
     session.emit("conversation_item_added", chat_item("user", "What is the fare?"))
@@ -4289,7 +4374,15 @@ async def test_a_meter_that_lands_during_speech_is_scoped_to_the_utterance(recor
     stt = [op for op in operations(read_events(_dir(rec))) if op["type"] == "stt"]
     response = stt[0]["response"]
     assert response.get("provider_metered_audio_ms") == 3000
-    assert response.get("metering_scope") == "utterance"
+    assert response.get("metered_arrival") == "before_final", (
+        "arrival is observable and must still be reported"
+    )
+    assert response.get("metering_scope") == "unknown", (
+        "a meter arriving mid-speech is not thereby an utterance meter"
+    )
+    assert "provider" in (response.get("metering_scope_note") or ""), (
+        "the payload must carry the caveat, not leave it to documentation"
+    )
     assert response.get("metered_after_final") is not True
 
 
@@ -4410,6 +4503,52 @@ async def test_an_answer_contained_in_the_filler_does_not_erase_it(recorder):
     assert "The fare is ready" in (response.get("text") or ""), (
         "the filler's words were replaced by a fragment of themselves"
     )
-    assert response.get("char_count") == len("The fare is ready"), (
+    assert "The fare is ready fare" == (response.get("text") or ""), (
+        "the caller heard two separate utterances and both belong on the span"
+    )
+    assert response.get("char_count") == len("The fare is ready") + len("fare"), (
         "text and char_count must describe the same speech"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_same_item_delivered_twice_is_only_counted_once(recorder):
+    """Identity, not words, is what makes an utterance a repeat.
+
+    The span has to answer "have I already recorded this" without deciding it
+    from the text, because two utterances can legitimately share their words --
+    an agent that says "one moment" twice said it twice. LiveKit gives every
+    chat item an id, so a redelivery of one item is distinguishable from two
+    items that happen to read alike.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("Are you there?", True))
+    session.emit("conversation_item_added", chat_item("user", "Are you there?"))
+    filler = FakeSpeechHandle("filler-1")
+    session.emit("speech_created", speech_created(filler, source="say"))
+    session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
+    answer = FakeSpeechHandle("answer-1")
+    session.emit("speech_created", speech_created(answer))
+    session.emit("metrics_collected", tts_metrics("answer-1", audio_duration=2.0))
+    filler_item = chat_item("assistant", "One moment", item_id="item-same")
+    filler.chat_items.append(filler_item.item)
+    session.emit("conversation_item_added", filler_item)
+    # The very same item delivered a second time.
+    session.emit("conversation_item_added", filler_item)
+    # A different item whose words are identical -- genuinely spoken twice.
+    twin = chat_item("assistant", "One moment", item_id="item-other")
+    answer.chat_items.append(twin.item)
+    session.emit("conversation_item_added", twin)
+    await rec.finish()
+
+    tts = [op for op in operations(read_events(_dir(rec))) if op["type"] == "tts"]
+    response = tts[0]["response"]
+    assert response.get("char_count") == len("One moment") * 2, (
+        "a redelivered item must not add, and a genuine repeat must"
+    )
+    assert (response.get("text") or "") == "One moment One moment", (
+        "the agent said it twice, so the transcript says it twice"
     )

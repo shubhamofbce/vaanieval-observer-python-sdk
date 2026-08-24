@@ -44,6 +44,7 @@ import inspect
 import logging
 import os
 import sys
+import sysconfig
 from typing import Any, Dict, List, Mapping, Optional
 
 from .._diagnostics import warn_once
@@ -520,15 +521,78 @@ def _reply_call_site(depth_limit: int = 60) -> Optional[str]:
     while frame is not None and seen < depth_limit:
         seen += 1
         if frame.f_code is _GENERATE_REPLY_CODE:
-            caller = frame.f_back
-            if caller is None:
-                return "application"
-            origin = os.path.abspath(caller.f_code.co_filename)
-            if any(origin.startswith(root) for root in _LIVEKIT_ROOTS):
-                return "framework"
-            return "application"
+            return _caller_owner(frame.f_back)
         frame = frame.f_back
     return None
+
+
+def _stdlib_roots() -> tuple:
+    """Where the interpreter's own modules live, with a trailing separator.
+
+    A stdlib module's own `__file__` is asked first, because that is the string
+    a frame will actually carry. `sysconfig` reports the *installation* prefix,
+    which on a Homebrew, pyenv or conda build is a symlink to somewhere else --
+    so matching against it alone silently matched nothing, and every deferred
+    call was read as the application's. Both are kept: `sysconfig` still covers
+    layouts where `os` is frozen into the binary and has no usable path.
+    """
+    roots = []
+    for module in (os, sysconfig):
+        path = getattr(module, "__file__", None)
+        if path:
+            roots.append(os.path.dirname(os.path.abspath(path)))
+    try:
+        paths = sysconfig.get_paths()
+        roots.extend(paths[name] for name in ("stdlib", "platstdlib")
+                     if paths.get(name))
+    except Exception:  # noqa: BLE001 - unusual builds may not report these
+        pass
+    return tuple(dict.fromkeys(
+        os.path.join(os.path.abspath(root), "") for root in roots))
+
+
+_STDLIB_ROOTS = _stdlib_roots()
+
+# Installed packages live *under* the interpreter's own library directory, so
+# a root check alone calls every third-party module -- including the adopter's
+# own, if their agent is installed rather than run from a checkout --
+# interpreter plumbing, and steps over the frame that actually decided.
+_INSTALLED_MARKERS = ("site-packages", "dist-packages")
+
+
+def _is_interpreter_plumbing(origin: str) -> bool:
+    """Is this frame the interpreter's own code, rather than somebody's?"""
+    if not any(origin.startswith(root) for root in _STDLIB_ROOTS):
+        return False
+    parts = origin.split(os.sep)
+    return not any(marker in parts for marker in _INSTALLED_MARKERS)
+
+
+def _caller_owner(caller: Any, indirection_limit: int = 8) -> str:
+    """Whose code asked for this reply, looking past the plumbing in between.
+
+    The frame immediately above the public method is not always the one that
+    decided to call it: `functools.partial`, a `Task` wrapper or a decorator
+    puts a standard-library frame there instead. Reading that frame literally
+    would answer "the application" for every such call -- including LiveKit's
+    own, which is the misattribution this function exists to end. Interpreter
+    frames are therefore stepped over, up to a small bound, until a frame that
+    belongs to somebody is found.
+
+    Defaults to "application", which only ever adds a caveat. Guessing
+    "framework" would remove one, and a caveat missing from a reply that needed
+    it is the failure an adopter cannot see.
+    """
+    steps = 0
+    while caller is not None and steps < indirection_limit:
+        steps += 1
+        origin = os.path.abspath(caller.f_code.co_filename)
+        if any(origin.startswith(root) for root in _LIVEKIT_ROOTS):
+            return "framework"
+        if not _is_interpreter_plumbing(origin):
+            return "application"
+        caller = caller.f_back
+    return "application"
 
 
 # LiveKit waits this long for a realtime model's automatic reply to a tool

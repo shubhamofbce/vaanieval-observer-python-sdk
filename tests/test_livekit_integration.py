@@ -4148,14 +4148,35 @@ def public_generate_reply(monkeypatch, tmp_path):
     monkeypatch.setattr(livekit_integration, "_LIVEKIT_ROOTS",
                         (os.path.join(str(root.parent.resolve()), ""),))
 
-    def framework_caller(session, _from=None, **kwargs):
-        """A call to the public method made from inside the installed package."""
-        source = "def call(session, kwargs):\n    return session.generate_reply(**kwargs)\n"
+    def framework_caller(session, _from=None, _deferred=False,
+                         _run_from=None, **kwargs):
+        """A call to the public method made from inside the installed package.
+
+        `_deferred` hands the call to the interpreter instead of making it
+        directly, so the frames read package -> interpreter -> public method,
+        which is what a deferred callback, a task wrapper or a decorator
+        produces in an installed LiveKit.
+        """
+        source = ("import contextlib\n"
+                  "def call(session, kwargs, deferred, run_from):\n"
+                  "    if run_from is not None:\n"
+                  "        return run_from(session, kwargs)\n"
+                  "    if not deferred:\n"
+                  "        return session.generate_reply(**kwargs)\n"
+                  "    with contextlib.ExitStack() as stack:\n"
+                  "        stack.callback(session.generate_reply, **kwargs)\n")
         namespace: dict = {}
         default = root / "voice" / "agent_activity.py"
         path = str((_from or default).resolve())
         exec(compile(source, path, "exec"), namespace)
-        return namespace["call"](session, kwargs)
+        outer = None
+        if _run_from is not None:
+            inner: dict = {}
+            exec(compile("def ask(session, kwargs):\n"
+                         "    return session.generate_reply(**kwargs)\n",
+                         str(_run_from.resolve()), "exec"), inner)
+            outer = inner["ask"]
+        return namespace["call"](session, kwargs, _deferred, outer)
 
     framework_caller.package_root = root.parent
     return framework_caller
@@ -4463,6 +4484,96 @@ async def test_a_livekit_plugin_asking_for_a_reply_is_not_the_application(
     assert llm["turn_id"] != first["turn_id"]
     assert llm["response"].get("reply_attribution") is None, (
         "a plugin's own call was reported as the application's guesswork"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_reply_livekit_asked_for_through_the_stdlib_is_still_livekits(
+        recorder, public_generate_reply):
+    """The frame above the public method is not always the one that decided.
+
+    A deferred callback, a task wrapper or a decorator puts a standard-library
+    frame there instead; `ExitStack` stands for all of them here because it is
+    the one that is trivially reproducible. Read literally, that frame belongs
+    to no package, so every such call answered "the application" -- LiveKit's
+    own reply detached from the caller and published under a caveat, which is
+    the misattribution stack inspection was introduced to end. Interpreter
+    frames are stepped over until a frame that belongs to somebody is found,
+    and "application" stays the answer when none does, because that only ever
+    adds a caveat.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("What is the fare?", True))
+    session.emit("conversation_item_added", chat_item("user", "What is the fare?"))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("filler-1"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("And to Boston?", False))
+
+    public_generate_reply(session, _deferred=True,
+                          input_modality="audio", handle_id="answer-2")
+    session.emit("metrics_collected", tts_metrics("answer-2", audio_duration=2.0))
+    rec.tap_output_frame(agent_frame(2000))
+    session.emit("user_input_transcribed", transcript("And to Boston?", True))
+    session.emit("conversation_item_added", chat_item("user", "And to Boston?"))
+    await rec.finish()
+
+    reply = next(op for op in operations(read_events(_dir(rec)))
+                 if op["type"] == "tts"
+                 and op["response"].get("audio_ms") == 2000)
+    assert reply["response"].get("reply_attribution") is None, (
+        "a reply LiveKit asked for indirectly was published as the "
+        "application's guesswork"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_installed_application_is_not_mistaken_for_the_interpreter(
+        recorder, public_generate_reply, monkeypatch, tmp_path):
+    """An adopter whose agent is installed, not run from a checkout.
+
+    Installed packages live *under* the interpreter's library directory, so
+    treating that whole directory as plumbing stepped over the application's
+    own frame and kept walking -- reaching LiveKit's frame above it and
+    reporting the reply as the framework's, with the caveat dropped. A reply
+    the application asked for, published as settled fact.
+    """
+    library = tmp_path / "lib" / "python3.14"
+    app = library / "site-packages" / "my_agent" / "flows.py"
+    app.parent.mkdir(parents=True)
+    monkeypatch.setattr(livekit_integration, "_STDLIB_ROOTS",
+                        (os.path.join(str(library.resolve()), ""),))
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("What is the fare?", True))
+    session.emit("conversation_item_added", chat_item("user", "What is the fare?"))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("filler-1"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("And to Boston?", False))
+
+    # LiveKit calls into the installed application, which asks for the reply.
+    public_generate_reply(session, _run_from=app, input_modality="audio",
+                          handle_id="answer-2")
+    session.emit("metrics_collected", tts_metrics("answer-2", audio_duration=2.0))
+    rec.tap_output_frame(agent_frame(2000))
+    await rec.finish()
+
+    reply = next(op for op in operations(read_events(_dir(rec)))
+                 if op["type"] == "tts"
+                 and op["response"].get("audio_ms") == 2000)
+    assert reply["response"].get("reply_attribution") == "inferred", (
+        "an installed application's own reply was published as the "
+        "framework's, with no caveat"
     )
 
 

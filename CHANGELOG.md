@@ -48,6 +48,16 @@ yours. The comparison keeps a trailing separator, so a project directory named
 `livekit_helpers` beside `livekit` is not taken for a package inside it — that
 mistake would have dropped the caveat from a reply you asked for.
 
+The frame directly above the public method is not always the one that decided:
+a deferred callback, a task wrapper or a decorator puts an interpreter frame
+there. Those are stepped over, up to a small bound, until a frame that belongs
+to somebody is reached — but *only* interpreter frames, and installed packages
+live under the interpreter's own library directory, so `site-packages` and
+`dist-packages` are explicitly excluded. Without that, an adopter whose agent is
+installed rather than run from a checkout would have had their own reply read as
+LiveKit's, with the caveat dropped. Where nothing can be established the answer
+stays "yours", which only ever adds a caveat.
+
 Verified across eight routes against a real `AgentSession` on livekit-agents
 1.7.0, including a bound method saved before recording started and a caller
 compiled inside the `livekit` package.

@@ -10,4 +10,4 @@ claimed `0.1.0` however much had changed underneath it.
 version cannot disagree.
 """
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"

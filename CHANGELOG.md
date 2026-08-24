@@ -4,6 +4,83 @@ Every recorded package stamps its SDK version into the manifest, so the version
 here is what a bug report is tied back to. Entries describe what changed about
 *the data* — a fix that alters no recorded value is not worth an adopter's time.
 
+## 0.5.1
+
+An eighth review pass over the 0.5.0 fixes. One release-blocking defect: a
+reply's measured token counts could be filed against a turn with no question in
+it. No field changed meaning, hence the patch bump.
+
+### A reply is now attributed by asking LiveKit, not by guessing
+
+While a filler is playing, a reply that arrives over a partial transcript is
+either this caller's own delayed answer or one predicted for the caller talking
+over them. The events cannot tell the two apart: a preflight transcript and an
+ordinary interim reach the SDK as the same `user_input_transcribed(is_final=
+False)`. Both were therefore refused, and the ordinary case — the common one —
+published the reply's measured `total_tokens`, `prompt_tokens` and first-token
+latency against a turn that contained no question, while the question itself
+read as unanswered. One exchange described wrongly twice, with the cost on the
+wrong side of it, under a caveat that admitted the doubt without resolving it.
+
+LiveKit does distinguish them, just not at the moment the SDK first hears about
+the reply. An ordinary reply is marked scheduled in the same synchronous frame
+that created it; preemptive generation deliberately is not, and stays unscheduled
+until the predicted turn is validated. The decision now waits the one event-loop
+iteration that takes and reads `SpeechHandle.scheduled`. Scheduled replies join
+the turn they were scheduled for; unscheduled ones keep their own turn, so a
+caller's words are never reported as answered before they were spoken.
+
+Nothing is bound during that iteration, which leaves the previous turn current —
+the same turn anything arriving between the filler and the reply would have
+landed on anyway. The decision is also settled on demand by whichever of the
+metric, the audio stream or the next speech needs the turn first, because
+waiting on the loop alone would have made attribution depend on arrival order,
+and an operation already written cannot be moved.
+
+Verified against real `SpeechHandle` objects on livekit-agents 1.7.0 as well as
+1.6.10, in both directions.
+
+### The attribution caveat now means what it says
+
+`reply_attribution: "inferred"` was published for every reply that followed a
+filler. It is now recorded only where the ownership genuinely cannot be read:
+builds whose speech handle does not report scheduling at all. A caveat that
+appears on correct data teaches adopters to ignore it.
+
+Derived LLM spans — reconstructed from `conversation_item_added` when no plugin
+emits `metrics_collected` — now carry the caveat too. It was the one publisher
+the disclosure never reached, so a per-turn latency from a build with no LLM
+metrics looked settled when it was not.
+
+### Split exchanges: which stage was measured twice is now recorded
+
+The console warned that a stage may be double counted by asking whether it had
+measured more populations than the range has turns. That proves a double count
+but cannot detect one: a split exchange plus one unrelated reply-only turn
+leaves the totals level, so the warning disappeared and the panel published full
+coverage for a stage measured twice. Which stages a split actually doubled is a
+fact about its two halves, so it is now recorded per stage when the halves are
+ingested and summed like any other counter.
+
+Two consequences worth stating. Stored calls are rebuilt on upgrade, because the
+new columns would otherwise sit at their default and the drift audit — which
+recomputes them — would have reported every already-stored split call as
+tampered with, permanently. And a time range that contains only one half of a
+split still reports the caveat, which over-warns rather than under-warns: the
+flag is carried by the continuation row, so a range ending between the halves
+sees it. Warning about an exchange whose other half is out of view is the safe
+direction.
+
+### A call's turn count no longer depends on who is counting
+
+A continuation row whose parent is missing — the parent fell outside the range,
+or was never recorded — was counted as a turn by the call rollup and the browser
+and subtracted by the rail, the range count, the overview and the hourly
+rollup. A reader could open a call listed as zero turns, read one turn in its
+headline, and see zero again in range. The rule is now applied once, where the
+rows are ingested, so every counter inherits it. Raw `continues_turn` is left
+untouched in the operation payload: that is what the SDK observed.
+
 ## 0.5.0
 
 A sixth review pass over the 0.4.0 fixes, which found four further defects of

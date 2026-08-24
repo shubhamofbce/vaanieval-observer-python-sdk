@@ -46,15 +46,21 @@ class FakeAgentSession:
             handler(event)
 
     def generate_reply(self, *, input_modality: str = "text",
-                       handle_id: str = "app-reply"):
+                       handle_id: str = "app-reply",
+                       user_initiated: bool = True):
         """What `AgentSession.generate_reply()` does that the recorder can see.
 
         The event is emitted synchronously inside the call and the handle is
         returned, and `input_modality` is passed through unchanged -- so with
         `"audio"` every field matches LiveKit's own automatic answer.
+
+        `user_initiated` is settable only so a test can put a stack marker and
+        an event marker in conflict; the public method itself always emits
+        `True` (`agent_activity.py:1561`).
         """
         handle = FakeSpeechHandle(handle_id, modality=input_modality)
-        self.emit("speech_created", speech_created(handle))
+        self.emit("speech_created",
+                  speech_created(handle, user_initiated=user_initiated))
         return handle
 
 
@@ -6497,4 +6503,58 @@ async def test_a_realtime_generation_is_not_reported_as_an_unreadable_stack(
     )
     assert "could not locate" not in reason, (
         "an ordinary realtime generation was reported as an unrecognised build"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_event_outranks_the_stack_when_both_name_a_route(
+        recorder, public_generate_reply):
+    """Three routes settle as `tool_reply`; only one can be published.
+
+    The realtime marker is carried *by the event*: LiveKit set it when it
+    constructed the speech (`agent_activity.py:2007`). The retry marker is read
+    off the stack, which is weaker evidence about a different question -- who
+    asked. If a reissue frame is on the stack when a server-side generation
+    arrives, the event is the fact and the frame is a coincidence, so the
+    realtime explanation has to win. Publishing the reissue story there would
+    point an operator at a run that has nothing to do with this reply.
+
+    Selection order is the whole of this behaviour, and nothing else asserts
+    it: every other test exercises one route at a time, where any order passes.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    rec.note_audio_tap_installed()
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("book it", True))
+    session.emit("conversation_item_added", chat_item("user", "book it"))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("filler-1"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    session.emit("function_tools_executed", tools_executed())
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("hello?", False))
+
+    # A reissue frame on the stack, and a server-side generation on the event.
+    retry_file = public_generate_reply.package_root / "voice" / "run_result.py"
+    public_generate_reply(session, _from=retry_file, handle_id="both-1",
+                          user_initiated=False)
+    session.emit("metrics_collected", llm_metrics("both-1"))
+    await rec.finish()
+
+    ops = operations(read_events(_dir(rec)))
+    llm = next(op for op in ops if op["type"] == "llm")
+    reason = llm["response"].get("reply_attribution_reason") or ""
+    assert "generated this reply server-side" in reason, (
+        "a server-side realtime generation was explained as a reissue, "
+        "because a retry frame happened to be on the stack -- the event says "
+        "what this reply is and the frame only says who called. Note both "
+        "reasons mention the word 'realtime', so only the phrase unique to "
+        "each one can tell them apart"
+    )
+    assert "reissued for a run that already exists" not in reason, (
+        "the caveat names a reissue for a reply the event says LiveKit's "
+        "realtime model generated on its own"
     )

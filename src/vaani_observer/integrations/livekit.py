@@ -43,6 +43,7 @@ import asyncio
 import inspect
 import logging
 import os
+import sys
 from typing import Any, Dict, List, Mapping, Optional
 
 from .._diagnostics import warn_once
@@ -267,6 +268,7 @@ class _TurnState:
                  "audio_first_at_ms", "finished", "tts_derived", "tts_ttfa_ms",
                  "reply_complete", "tts_text", "tts_reconstructed", "speech_handle",
                  "reply_source", "reply_attribution", "awaiting_tool_reply",
+                 "tool_reply_deadline_ms",
                  "filler_speech_id", "recorded_item_ids",
                  "open_streams", "awaiting_stream_close", "unscoped_audio_bytes",
                 "unscoped_audio_bytes_at_publish", "publication_snapshot_taken",
@@ -349,6 +351,14 @@ class _TurnState:
         # new speech. Cleared when a reply is bound, so only the answer actually
         # owed to the tool is read this way.
         self.awaiting_tool_reply = False
+        # When LiveKit itself stops waiting for that answer. A tool result whose
+        # reply never arrives -- an interrupted execution, or a realtime model
+        # configured not to generate one -- would otherwise leave the flag
+        # standing for the rest of the call, and the next caller's reply would
+        # be adopted backwards as the tool's. LiveKit gives up after five
+        # seconds (`agent_activity.py:4278`), so a generation arriving later
+        # than that is not the answer it was waiting for.
+        self.tool_reply_deadline_ms: Optional[int] = None
         # How many `tts_node` generators are still able to render for this
         # reply. A span closed while one is open publishes a duration shorter
         # than the audio the caller heard, and the frames that arrive after it
@@ -438,7 +448,69 @@ def _set_metering_scope(response: Dict[str, Any]) -> None:
     )
 
 
-def _reply_origin(event: Any, handle: Any, *, application_call: bool,
+_GENERATE_REPLY_CODE: Any = None
+_LIVEKIT_ROOT: Optional[str] = None
+
+
+def _reply_call_site(depth_limit: int = 60) -> Optional[str]:
+    """Say whether `AgentSession.generate_reply()` is on the stack, and whose.
+
+    Replacing the method to count calls was wrong in both directions. A caller
+    that captured the bound method before `attach()` -- `send = session.
+    generate_reply` -- kept calling the original and was read as LiveKit's own
+    automatic answer, silently merged backwards into the previous caller's turn.
+    And LiveKit calls that same public method itself, in six places on 1.7.0
+    (`agent_activity.py:1693`, `run_result.py:292`, `tool_executor.py:599`,
+    `ivr/ivr_activity.py:53` and `:83`, `agent.py:346`), so counting calls also
+    reported the framework's own replies as the application's.
+
+    The stack answers both, because it is the one thing a captured reference
+    cannot change: the same code object runs either way, and the frame above it
+    says who asked. `speech_created` is emitted synchronously inside the call
+    (`agent_session.py:1508-1520`), so that frame is still there when this runs.
+
+    Returns "application", "framework", or None when the public method is not on
+    the stack at all -- which is the automatic answer, since that reaches
+    `_generate_reply` directly without passing through the public one.
+    """
+    global _GENERATE_REPLY_CODE, _LIVEKIT_ROOT
+    if _GENERATE_REPLY_CODE is None:
+        try:
+            from livekit.agents.voice.agent_session import AgentSession
+            import livekit.agents as _lk
+
+            _GENERATE_REPLY_CODE = AgentSession.generate_reply.__code__
+            _LIVEKIT_ROOT = os.path.dirname(os.path.abspath(_lk.__file__))
+        except Exception:  # noqa: BLE001 - version drift is survivable
+            _GENERATE_REPLY_CODE = False
+    if not _GENERATE_REPLY_CODE:
+        return None
+    try:
+        frame = sys._getframe(1)
+    except Exception:  # noqa: BLE001 - no stack introspection on this runtime
+        return None
+    seen = 0
+    while frame is not None and seen < depth_limit:
+        seen += 1
+        if frame.f_code is _GENERATE_REPLY_CODE:
+            caller = frame.f_back
+            if caller is None:
+                return "application"
+            origin = os.path.abspath(caller.f_code.co_filename)
+            if _LIVEKIT_ROOT and origin.startswith(_LIVEKIT_ROOT):
+                return "framework"
+            return "application"
+        frame = frame.f_back
+    return None
+
+
+# LiveKit waits this long for a realtime model's automatic reply to a tool
+# result before giving up (`agent_activity.py:4278`). A generation arriving
+# after it is not the answer that was owed.
+_TOOL_REPLY_WINDOW_MS = 5000
+
+
+def _reply_origin(event: Any, handle: Any, *, call_site: Optional[str],
                   tool_reply_pending: bool) -> str:
     """Say which caller a reply was created for, or admit that it is unknown.
 
@@ -452,11 +524,12 @@ def _reply_origin(event: Any, handle: Any, *, application_call: bool,
       (`:2321` / `:2303`, `schedule_speech=False`, and so unscheduled until its
       predicted turn is validated);
     * that same function reached from the public
-      `AgentSession.generate_reply()`, which is why `application_call` has to be
-      observed at the call rather than read off the event. Its `input_modality`
+      `AgentSession.generate_reply()`, which is why the call site has to be
+      taken from the stack rather than read off the event. Its `input_modality`
       argument is passed through unchanged (`agent_session.py:1516`), so a
       caller passing `"audio"` produces an event identical in every field to the
-      automatic answer;
+      automatic answer. LiveKit calls that public method itself too, and a
+      framework call is a reply to the speech in flight, not an unknowable one;
     * a realtime model's server-side generation (`:2007` / `:1983`), scheduled
       at once with `user_initiated=False`.
 
@@ -479,8 +552,16 @@ def _reply_origin(event: Any, handle: Any, *, application_call: bool,
         return "unknown"
     if not user_initiated:
         return "tool_reply" if tool_reply_pending else "in_flight_speech"
-    if application_call:
+    if call_site == "application":
         return "unknown"
+    if call_site == "framework":
+        # LiveKit asking itself. Every one of these answers something already
+        # under way -- a manually committed realtime turn whose transcript
+        # follows, a retried structured output, an asynchronous tool result --
+        # so it belongs with the speech in flight or with the tool that is owed
+        # a reply. What it is never is the automatic answer to the turn a filler
+        # is holding open, which is what merging it backwards would claim.
+        return "tool_reply" if tool_reply_pending else "in_flight_speech"
     return "completed_turn"
 
 
@@ -633,11 +714,6 @@ class VaaniLiveKitRecorder:
         # even the modality matches -- and the only place the difference exists
         # is the call itself. Counted rather than flagged because a tool may
         # call it while another call is in progress.
-        self._application_reply_depth = 0
-        # (session, attribute, original, had_own) for methods wrapped to observe
-        # the call, so detaching leaves the session as it was found -- including
-        # whether the attribute was the session's own or the class's.
-        self._patched: List[tuple] = []
         self._sockets: List[Any] = []
         # (session, event name, wrapped handler). The *wrapped* reference has to
         # be kept or `session.off()` is impossible: LiveKit matches listeners by
@@ -797,8 +873,19 @@ class VaaniLiveKitRecorder:
         logger.warning("vaani: " + message, *args)
 
     def attach(self, session: Any) -> "VaaniLiveKitRecorder":
-        """Subscribe to an `AgentSession`. Safe to call on an inert recorder."""
+        """Subscribe to an `AgentSession`. Safe to call on an inert recorder.
+
+        Subscribing to the same session twice is a mistake a retry, a reconnect
+        or a second entry point makes for you, and it used to register a second
+        copy of every handler: one final transcript then ran `_on_transcript`
+        twice and the turn published the caller's words doubled, with the
+        manifest still reporting the capture complete. Nothing downstream can
+        tell a doubled transcript from a caller who repeated themselves, so this
+        is idempotent per session instead.
+        """
         if self.call is None:
+            return self
+        if any(attached is session for attached, _, _ in self._attached):
             return self
         handlers = {
             "user_state_changed": self._on_user_state,
@@ -826,78 +913,8 @@ class VaaniLiveKitRecorder:
                 )
                 continue
             self._attached.append((session, name, wrapped))
-        self._watch_application_replies(session)
         self._sniff_models(session)
         return self
-
-    def _watch_application_replies(self, session: Any) -> None:
-        """Notice when the application asks for a reply itself.
-
-        `AgentSession.generate_reply()` reaches the same `_generate_reply` as
-        LiveKit's automatic answer to a completed turn, emits `speech_created`
-        synchronously inside the call (`agent_session.py:1508-1520`), and passes
-        `input_modality` through unchanged -- so an application passing
-        `"audio"` produces an event identical in every field to the automatic
-        one. The two are only distinguishable from the call, and the difference
-        decides whether a reply may be merged into the turn a filler is holding
-        open. Wrapping is confined to counting the call: the original is invoked
-        with the arguments it was given and its result returned untouched.
-        """
-        original = getattr(session, "generate_reply", None)
-        if not callable(original):
-            return
-        if getattr(original, "_vaani_watcher", None) is self:
-            # Attaching twice must not stack this recorder's own wrapper. A
-            # *different* recorder's wrapper is chained rather than skipped:
-            # skipping it left the second recorder counting nothing, and a
-            # recorder that cannot see the call reports an application's own
-            # reply as the automatic answer -- silently, which is the failure
-            # this whole mechanism exists to end.
-            return
-
-        def wrapper(*args: Any, **kwargs: Any) -> Any:
-            self._application_reply_depth += 1
-            try:
-                # Through the attribute, not the closure, so a recorder further
-                # down the chain can splice itself out on detach.
-                return wrapper._vaani_next(*args, **kwargs)  # type: ignore[attr-defined]
-            finally:
-                self._application_reply_depth -= 1
-
-        wrapper._vaani_watcher = self  # type: ignore[attr-defined]
-        wrapper._vaani_next = original  # type: ignore[attr-defined]
-        try:
-            had_own = "generate_reply" in vars(session)
-            session.generate_reply = wrapper
-        except Exception as error:  # noqa: BLE001 - version drift is survivable
-            # Losing this only costs the distinction, and the reply then reads
-            # as unproven rather than as the automatic answer.
-            self._warn_once(
-                "watch:generate_reply",
-                "cannot observe generate_reply (%s); replies arriving over a "
-                "filler will be reported as inferred", error,
-            )
-            return
-        self._patched.append((session, "generate_reply", original, had_own))
-
-    def _unlink_wrapper(self, outermost: Any) -> None:
-        """Splice this recorder's wrapper out of a chain someone else tops.
-
-        Walking by attribute rather than by closure is the whole reason the
-        wrapper delegates through `_vaani_next`: the recorder above ours holds
-        no reference we could rewrite otherwise, so detaching would either
-        disable it or leave a finished recorder counting for the life of the
-        session.
-        """
-        seen = set()
-        node = outermost
-        while node is not None and id(node) not in seen:
-            seen.add(id(node))
-            following = getattr(node, "_vaani_next", None)
-            if getattr(following, "_vaani_watcher", None) is self:
-                node._vaani_next = getattr(following, "_vaani_next", following)
-                return
-            node = following
 
     def _sniff_models(self, session: Any) -> None:
         """Learn each stage's real model from the plugin instance.
@@ -945,29 +962,6 @@ class VaaniLiveKitRecorder:
             except Exception as error:  # noqa: BLE001 - teardown must not raise
                 logger.debug("vaani: cannot unsubscribe from %r (%s)", name, error)
         self._attached.clear()
-        for session, attribute, original, had_own in self._patched:
-            try:
-                current = getattr(session, attribute, None)
-                if getattr(current, "_vaani_watcher", None) is not self:
-                    # Someone wrapped on top of ours. Putting the original back
-                    # would tear their wrapper off with it, so unlink ours from
-                    # inside the chain instead and leave theirs working. A
-                    # session outliving this recorder must not keep calling into
-                    # it, and must not lose another recorder either.
-                    self._unlink_wrapper(current)
-                    continue
-                # What our wrapper delegates to *now*, which is not always what
-                # it was given: a recorder underneath ours may have spliced
-                # itself out since. Restoring the captured value would put its
-                # detached wrapper back.
-                following = getattr(current, "_vaani_next", original)
-                if not had_own and following is original:
-                    delattr(session, attribute)
-                else:
-                    setattr(session, attribute, following)
-            except Exception as error:  # noqa: BLE001 - teardown must not raise
-                logger.debug("vaani: cannot restore %r (%s)", attribute, error)
-        self._patched.clear()
 
     async def finish(self, outcome: Optional[str] = None,
                      timeout: Optional[float] = None) -> None:
@@ -2117,6 +2111,7 @@ class VaaniLiveKitRecorder:
         # Whatever this reply turns out to be, the tool result is no longer
         # waiting on one, so a later generation is not read as its answer.
         state.awaiting_tool_reply = False
+        state.tool_reply_deadline_ms = None
         if contested:
             # Held on the turn rather than written straight into
             # `tts_response`: a reply can report LLM tokens and then be
@@ -2207,16 +2202,15 @@ class VaaniLiveKitRecorder:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return False
-        # Read now, not at settlement: both are true only for the duration of
-        # this handler. `generate_reply()` has returned by the next loop slice,
-        # and a tool result is owed a reply only until one is bound.
-        application_call = self._application_reply_depth > 0
-        tool_reply_pending = bool(getattr(carry, "awaiting_tool_reply", False))
+        # Read now, not at settlement: neither survives this handler. The call
+        # frame is gone by the next loop slice, and a tool result is owed a
+        # reply only until one is bound.
+        call_site = _reply_call_site()
+        tool_reply_pending = self._tool_reply_pending(carry)
         settle = _guard(
             self, "speech_created:contested",
             lambda evt: self._settle_contested_reply(
-                evt, speech_id, source, carry,
-                application_call=application_call,
+                evt, speech_id, source, carry, call_site=call_site,
                 tool_reply_pending=tool_reply_pending),
         )
         self._contested_events[speech_id] = event
@@ -2226,6 +2220,29 @@ class VaaniLiveKitRecorder:
             return False
         self._contested_pending[speech_id] = settle
         return True
+
+    def _tool_reply_pending(self, state: "_TurnState") -> bool:
+        """True while a tool result on this turn is still owed its answer.
+
+        The flag alone was not enough. LiveKit emits `function_tools_executed`
+        for results that require no reply at all, and after an interrupted
+        execution, and a realtime model configured without
+        `auto_tool_reply_generation` continues on the existing speech handle and
+        emits nothing that would clear it. In each case the flag stood until the
+        end of the call, and the next caller's realtime reply was adopted
+        backwards as the tool's answer.
+
+        `has_tool_reply` settles the first. The rest are bounded by the same
+        five seconds LiveKit waits before giving up on an auto tool reply, so a
+        generation arriving after that is not the one it was waiting for. Inside
+        that window a caller who barges in over the tool call can still be
+        confused with it, which is why the adoption is disclosed rather than
+        asserted.
+        """
+        if not getattr(state, "awaiting_tool_reply", False):
+            return False
+        deadline = getattr(state, "tool_reply_deadline_ms", None)
+        return deadline is None or self.call.now() <= deadline
 
     def _settle_pending(self, speech_id: Optional[str]) -> None:
         """Settle a deferred reply before anything reads the turn it belongs to.
@@ -2243,7 +2260,7 @@ class VaaniLiveKitRecorder:
             settle(self._contested_events.pop(speech_id, None))
 
     def _settle_contested_reply(self, event: Any, speech_id: str, source: str,
-                                carry: "_TurnState", *, application_call: bool,
+                                carry: "_TurnState", *, call_site: Optional[str],
                                 tool_reply_pending: bool) -> None:
         """Bind a deferred reply now that its handle has been read.
 
@@ -2261,7 +2278,7 @@ class VaaniLiveKitRecorder:
             # chose stands; a second binding here would move the turn under it.
             return
         handle = getattr(event, "speech_handle", None)
-        origin = _reply_origin(event, handle, application_call=application_call,
+        origin = _reply_origin(event, handle, call_site=call_site,
                                tool_reply_pending=tool_reply_pending)
         if origin == "completed_turn":
             if _is_unanswered_turn(carry, allow_filler=True):
@@ -3455,7 +3472,19 @@ class VaaniLiveKitRecorder:
         state = self._current_turn
         if state is None:
             return
-        state.awaiting_tool_reply = True
+        # Not every tool result is owed a reply, and LiveKit says which:
+        # `has_tool_reply` is the OR of the outputs' `reply_required`
+        # (`voice/events.py:447`), and a `StopResponse` output sets that False
+        # (`:441`). Treating the event's mere presence as proof left the flag
+        # standing after a result that asked for nothing, and the next caller's
+        # realtime generation was then adopted backwards as the tool's answer.
+        # A build too old to report it keeps the previous behaviour, which is
+        # the conservative direction: the flag only ever adds a caveat.
+        state.awaiting_tool_reply = getattr(event, "has_tool_reply", True) is not False
+        state.tool_reply_deadline_ms = (
+            self.call.now() + _TOOL_REPLY_WINDOW_MS
+            if state.awaiting_tool_reply else None
+        )
         try:
             pairs = event.zipped()
         except Exception:  # noqa: BLE001 - version drift is survivable

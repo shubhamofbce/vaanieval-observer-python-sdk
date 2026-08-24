@@ -15,6 +15,7 @@ import pytest
 
 from conftest import operations, read_events
 from vaani_observer import VaaniObserver
+from vaani_observer.integrations import livekit as livekit_integration
 from vaani_observer.integrations.livekit import (
     VaaniAudioTapMixin,
     VaaniLiveKitRecorder,
@@ -4129,8 +4130,38 @@ async def test_a_finished_filler_turn_does_not_adopt_the_next_callers_reply(reco
     )
 
 
+@pytest.fixture
+def public_generate_reply(monkeypatch, tmp_path):
+    """Stand the fake session's method in for `AgentSession.generate_reply`.
+
+    `livekit-agents` is not installed here -- these tests exist so the recorder
+    can be driven without it -- so the code object the stack is matched against
+    is pointed at the fake, and a directory stands in for the installed package.
+    What is under test is the rule: the public method on the stack, and who the
+    frame above it belongs to. The same rule is exercised against the real
+    `AgentSession` and a real captured bound method in `verify_real_handle.py`.
+    """
+    root = tmp_path / "livekit" / "agents"
+    (root / "voice").mkdir(parents=True)
+    monkeypatch.setattr(livekit_integration, "_GENERATE_REPLY_CODE",
+                        FakeAgentSession.generate_reply.__code__)
+    monkeypatch.setattr(livekit_integration, "_LIVEKIT_ROOT",
+                        str(root.parent.resolve()))
+
+    def framework_caller(session, **kwargs):
+        """A call to the public method made from inside the installed package."""
+        source = "def call(session, kwargs):\n    return session.generate_reply(**kwargs)\n"
+        namespace: dict = {}
+        path = str((root / "voice" / "agent_activity.py").resolve())
+        exec(compile(source, path, "exec"), namespace)
+        return namespace["call"](session, kwargs)
+
+    return framework_caller
+
+
 @pytest.mark.asyncio
-async def test_a_reply_the_application_asked_for_admits_it_might_answer_the_caller(recorder):
+async def test_a_reply_the_application_asked_for_admits_it_might_answer_the_caller(
+        recorder, public_generate_reply):
     """The one thing this must never be is silent.
 
     `AgentSession.generate_reply()` reaches the same `_generate_reply` as
@@ -4138,8 +4169,8 @@ async def test_a_reply_the_application_asked_for_admits_it_might_answer_the_call
     an application asking for audio produces an event identical in every field:
     scheduled, `user_initiated`, audio input details. Reading the event alone
     cannot separate them, and an application may call it to answer the caller or
-    to say something unrelated. The recorder notices the call instead -- but
-    noticing that it happened is not the same as knowing what it meant.
+    to say something unrelated. The recorder reads the call site off the stack
+    instead -- but knowing the call happened is not knowing what it meant.
 
     The recorder keeps such a reply separate, because merging two exchanges
     makes a caller's words appear answered before they were spoken. But that is
@@ -4363,54 +4394,122 @@ async def test_a_realtime_models_own_reply_is_not_merged_into_the_previous_calle
 
 
 @pytest.mark.asyncio
-async def test_a_second_recorder_on_one_session_still_sees_the_call(recorder):
-    """Two recorders must not blind each other to who asked for a reply.
+async def test_attaching_the_same_recorder_twice_does_not_record_the_call_twice(
+        recorder):
+    """Subscribing again is a mistake a restart or a retry makes for you.
 
-    Observing `generate_reply` means replacing it, and a recorder that skipped
-    an already-replaced method counted nothing -- so its packages reported an
-    application's own reply as the automatic answer to the previous caller,
-    silently, which is the failure the observation exists to prevent. Wrappers
-    chain instead, and tearing one down leaves a wrapper someone else put on
-    top in place.
+    Every handler was registered a second time, so one final transcript ran
+    `_on_transcript` twice and the turn published the caller's words doubled --
+    `"hello hello"` for one `"hello"` -- while the manifest still reported the
+    capture complete. Anything derived from the transcript, including an
+    evaluation of what the caller asked for, is then wrong with no sign of it.
     """
-    first = recorder()
-    second = recorder()
+    rec = recorder()
     session = FakeAgentSession()
-    first.attach(session)
-    second.attach(session)
-    for rec in (first, second):
-        rec.note_audio_tap_installed()
-        session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    rec.attach(session)
+    rec.attach(session)
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("hello", True))
+    session.emit("conversation_item_added", chat_item("user", "hello"))
+    await rec.finish()
+
+    stt = [op for op in operations(read_events(_dir(rec))) if op["type"] == "stt"]
+    assert len(stt) == 1, "the same utterance was recorded once per subscription"
+    assert stt[0]["response"]["transcript"] == "hello", (
+        "the caller's words were doubled by a second copy of the handler"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_session_reused_for_a_second_call_is_recorded_again(recorder):
+    """Refusing a repeat subscription must not refuse a legitimate one.
+
+    A worker that keeps one `AgentSession` and records consecutive calls on it
+    attaches, finishes, and attaches again. `finish()` unsubscribes, so the
+    second attach is not a duplicate -- and a guard that remembered the session
+    forever would have silently recorded an empty second call while the rest of
+    the package looked healthy.
+    """
+    session = FakeAgentSession()
+    first_recorder = recorder()
+    first_recorder.attach(session)
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("first call", True))
+    session.emit("conversation_item_added", chat_item("user", "first call"))
+    await first_recorder.finish()
+
+    second_recorder = recorder()
+    second_recorder.attach(session)
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("second call", True))
+    session.emit("conversation_item_added", chat_item("user", "second call"))
+    await second_recorder.finish()
+
+    for rec, expected in ((first_recorder, "first call"),
+                          (second_recorder, "second call")):
+        stt = [op for op in operations(read_events(_dir(rec)))
+               if op["type"] == "stt"]
+        assert [op["response"]["transcript"] for op in stt] == [expected], (
+            "a session reused for a second call recorded the wrong words, or "
+            "none at all"
+        )
+
+
+@pytest.mark.asyncio
+async def test_livekits_own_call_to_the_public_method_is_not_the_applications(
+        recorder, public_generate_reply):
+    """LiveKit calls `AgentSession.generate_reply()` itself, in six places.
+
+    On 1.7.0 it is used to commit a realtime turn manually
+    (`agent_activity.py:1693`), to retry a structured output
+    (`run_result.py:292`), to answer an asynchronous tool result
+    (`tool_executor.py:599`), and by the IVR activity (`ivr_activity.py:53`,
+    `:83`). Counting calls therefore reported the framework's own replies as the
+    application's: a detached turn under a caveat, with the caller's final
+    transcript opening yet another turn after it, so the tokens and the question
+    ended up two turns apart.
+
+    Every one of those routes answers something already under way, which is the
+    same shape as a realtime generation: its own turn, which the final
+    transcript then joins. The frame above the call says which it is.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    rec.note_audio_tap_installed()
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
     session.emit("user_input_transcribed", transcript("question one", True))
     session.emit("conversation_item_added", chat_item("user", "question one"))
     session.emit("speech_created",
                  speech_created(FakeSpeechHandle("filler"), source="say"))
     session.emit("metrics_collected", tts_metrics("filler", audio_duration=0.4))
-    session.emit("user_input_transcribed", transcript("um", False))
-    session.generate_reply(input_modality="audio", handle_id="own-reply")
-    session.emit("metrics_collected", llm_metrics("own-reply"))
-    await first.finish()
-    await second.finish()
+    rec.tap_output_frame(agent_frame(400))
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("question", False))
+    public_generate_reply(session, input_modality="audio", handle_id="answer-2")
+    session.emit("metrics_collected", llm_metrics("answer-2"))
+    # LiveKit committed the turn, so the final transcript follows its reply.
+    session.emit("user_input_transcribed", transcript("question two", True))
+    session.emit("conversation_item_added", chat_item("user", "question two"))
+    await rec.finish()
 
-    for name, rec in (("first", first), ("second", second)):
-        ops = operations(read_events(_dir(rec)))
-        llm = next(op for op in ops if op["type"] == "llm")
-        assert llm["response"].get("reply_attribution") == "inferred", (
-            f"the {name} recorder could not see the call and reported an "
-            "application's own reply as the answer to the previous caller"
-        )
-
-    # And the session is handed back as it was found. A leftover wrapper keeps
-    # a finished recorder on the call path for the life of the session, which is
-    # a leak with a counter in it.
-    assert getattr(session.generate_reply, "_vaani_watcher", None) is None, (
-        "a wrapper outlived both recorders, keeping a finished recorder on the "
-        "call path for the life of the session"
+    ops = operations(read_events(_dir(rec)))
+    first = next(op for op in ops if op["type"] == "stt"
+                 and "question one" in (op["response"].get("transcript") or ""))
+    second = next(op for op in ops if op["type"] == "stt"
+                  and "question two" in (op["response"].get("transcript") or ""))
+    llm = next(op for op in ops if op["type"] == "llm")
+    assert llm["turn_id"] != first["turn_id"], (
+        "the framework's reply was merged into the turn the filler was holding "
+        "open, which is the one caller it cannot be for"
     )
-    assert session.generate_reply.__func__ is FakeAgentSession.generate_reply, (
-        "the session was not handed back the method it came with"
+    assert llm["turn_id"] == second["turn_id"], (
+        "the reply and the question it answers were recorded two turns apart, "
+        "so the turn has tokens with no question and the question has no answer"
     )
-    session.generate_reply(input_modality="audio", handle_id="after-detach")
+    assert llm["response"].get("reply_attribution") is None, (
+        "the framework's own call is not a guess: the stack says who made it"
+    )
 
 
 def tools_executed(name: str = "search_flights") -> Any:
@@ -4418,6 +4517,98 @@ def tools_executed(name: str = "search_flights") -> Any:
     output = SimpleNamespace(output='{"price":6000}', is_error=False, call_id="c1")
     return SimpleNamespace(function_calls=[call], function_call_outputs=[output],
                            zipped=lambda: [(call, output)])
+
+
+@pytest.mark.asyncio
+async def test_a_tool_result_that_asks_for_no_reply_does_not_claim_the_next_one(
+        recorder):
+    """`function_tools_executed` is not proof that a reply is owed.
+
+    A tool returning `StopResponse` sets `reply_required` False on its output,
+    and `has_tool_reply` is the OR of those (`voice/events.py:441,447`). Reading
+    the event's mere presence left the flag standing after a result that asked
+    for nothing, so the next caller's realtime generation was adopted backwards
+    as the tool's answer -- putting its tokens on an exchange that ended before
+    the caller spoke.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    rec.note_audio_tap_installed()
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("stop talking", True))
+    session.emit("conversation_item_added", chat_item("user", "stop talking"))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("filler"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    event = tools_executed()
+    event.has_tool_reply = False
+    session.emit("function_tools_executed", event)
+    # A new caller, and the realtime model's reply to them.
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("hello", False))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("answer-2"), user_initiated=False))
+    session.emit("metrics_collected", llm_metrics("answer-2"))
+    session.emit("user_input_transcribed", transcript("are you there", True))
+    session.emit("conversation_item_added", chat_item("user", "are you there"))
+    await rec.finish()
+
+    ops = operations(read_events(_dir(rec)))
+    first = next(op for op in ops if op["type"] == "stt"
+                 and "stop talking" in (op["response"].get("transcript") or ""))
+    llm = next(op for op in ops if op["type"] == "llm")
+    assert llm["turn_id"] != first["turn_id"], (
+        "a reply was adopted into a turn whose tool result had explicitly "
+        "asked for no reply"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_tool_reply_that_never_arrives_stops_claiming_later_replies(
+        recorder):
+    """An interrupted tool execution emits the event and answers nothing.
+
+    So does a realtime model configured without `auto_tool_reply_generation`,
+    which continues on the existing speech handle and emits no `speech_created`
+    that could clear the flag (`agent_activity.py:4305-4328`). The flag then
+    stood for the rest of the call and the next caller's reply was adopted
+    backwards. LiveKit stops waiting after five seconds
+    (`agent_activity.py:4278`); so does this.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    rec.note_audio_tap_installed()
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("book it", True))
+    session.emit("conversation_item_added", chat_item("user", "book it"))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("filler"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    session.emit("function_tools_executed", tools_executed())
+    # No reply comes. Long after LiveKit gave up, someone else speaks.
+    turn = rec._current_turn
+    turn.tool_reply_deadline_ms = rec.call.now() - 1
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("hello", False))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("answer-2"), user_initiated=False))
+    session.emit("metrics_collected", llm_metrics("answer-2"))
+    session.emit("user_input_transcribed", transcript("still there", True))
+    session.emit("conversation_item_added", chat_item("user", "still there"))
+    await rec.finish()
+
+    ops = operations(read_events(_dir(rec)))
+    first = next(op for op in ops if op["type"] == "stt"
+                 and "book it" in (op["response"].get("transcript") or ""))
+    llm = next(op for op in ops if op["type"] == "llm")
+    assert llm["turn_id"] != first["turn_id"], (
+        "a tool result whose answer never came kept claiming replies for the "
+        "rest of the call"
+    )
 
 
 @pytest.mark.asyncio

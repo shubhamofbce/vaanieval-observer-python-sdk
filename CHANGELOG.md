@@ -23,12 +23,26 @@ read as unanswered. One exchange described wrongly twice, with the cost on the
 wrong side of it, under a caveat that admitted the doubt without resolving it.
 
 LiveKit does distinguish them, just not at the moment the SDK first hears about
-the reply. An ordinary reply is marked scheduled in the same synchronous frame
-that created it; preemptive generation deliberately is not, and stays unscheduled
-until the predicted turn is validated. The decision now waits the one event-loop
-iteration that takes and reads `SpeechHandle.scheduled`. Scheduled replies join
-the turn they were scheduled for; unscheduled ones keep their own turn, so a
-caller's words are never reported as answered before they were spoken.
+the reply, and not through a single field. There are four ways a reply is
+created and three of them say who they are for: the automatic answer to a
+completed user turn is scheduled in the same synchronous frame that created it,
+reports `user_initiated` and carries audio input details; preemptive generation
+deliberately is not scheduled, and stays that way until the predicted turn is
+validated; a realtime model's server-side generation is scheduled at once but is
+not `user_initiated`, and it answers the speech still being transcribed — that
+provider may withhold the final transcript until its reply exists, so the reply
+legitimately precedes the words that prompted it.
+
+The decision now waits the one event-loop iteration that scheduling takes and
+then reads all three signals. Automatic answers join the turn they answer.
+Preemptive and realtime replies keep their own turn, which the caller's final
+transcript then joins, so a caller's words are never reported as answered before
+they were spoken.
+
+Scheduling alone is not enough, and reading it alone was itself a defect caught
+before release: it is queue state, not provenance. A realtime reply is queued
+immediately and would have been merged backwards into the previous caller's
+turn, and reported as certain.
 
 Nothing is bound during that iteration, which leaves the previous turn current —
 the same turn anything arriving between the filler and the reply would have
@@ -37,15 +51,19 @@ metric, the audio stream or the next speech needs the turn first, because
 waiting on the loop alone would have made attribution depend on arrival order,
 and an operation already written cannot be moved.
 
-Verified against real `SpeechHandle` objects on livekit-agents 1.7.0 as well as
-1.6.10, in both directions.
+Verified against real `SpeechHandle` and `SpeechCreatedEvent` objects on
+livekit-agents 1.7.0, and against 1.6.10 source, in all four directions.
 
 ### The attribution caveat now means what it says
 
 `reply_attribution: "inferred"` was published for every reply that followed a
 filler. It is now recorded only where the ownership genuinely cannot be read:
-builds whose speech handle does not report scheduling at all. A caveat that
-appears on correct data teaches adopters to ignore it.
+a reply your own code asked for with `AgentSession.generate_reply()`, which is
+indistinguishable from the automatic answer except that its input modality
+defaults to text — and which may be answering the caller or saying something
+unrelated. Builds too old to report these signals also keep the caveat, rather
+than being merged on an assumption. A caveat that appears on correct data
+teaches adopters to ignore it; one that disappears on a guess is worse.
 
 Derived LLM spans — reconstructed from `conversation_item_added` when no plugin
 emits `metrics_collected` — now carry the caveat too. It was the one publisher
@@ -65,11 +83,12 @@ ingested and summed like any other counter.
 Two consequences worth stating. Stored calls are rebuilt on upgrade, because the
 new columns would otherwise sit at their default and the drift audit — which
 recomputes them — would have reported every already-stored split call as
-tampered with, permanently. And a time range that contains only one half of a
-split still reports the caveat, which over-warns rather than under-warns: the
-flag is carried by the continuation row, so a range ending between the halves
-sees it. Warning about an exchange whose other half is out of view is the safe
-direction.
+tampered with, permanently. And the split is recorded against the half the
+exchange *started* on, so an hour holding only the second half reports neither
+the exchange nor its caveat. That is the rule calls already follow when they
+span an hour: counted once, where they began. Recording it on the continuation
+instead made an hour report zero exchanges and, in the same response, that one
+of them carried more than one utterance.
 
 ### A call's turn count no longer depends on who is counting
 
@@ -80,6 +99,13 @@ rollup. A reader could open a call listed as zero turns, read one turn in its
 headline, and see zero again in range. The rule is now applied once, where the
 rows are ingested, so every counter inherits it. Raw `continues_turn` is left
 untouched in the operation payload: that is what the SDK observed.
+
+Rows ingested by an earlier release are re-decided on upgrade. The previous
+backfill trusted that a turn saying it continues another one had that other one
+present, which is exactly the case that fails; and because the schema version
+already recorded that the backfill had run, nothing would have revisited them.
+An upgraded database showed no turns in the session rail and one everywhere
+else, for the same call.
 
 ## 0.5.0
 

@@ -266,7 +266,7 @@ class _TurnState:
                  "tts_response", "tts_ended_at", "tools", "audio_bytes",
                  "audio_first_at_ms", "finished", "tts_derived", "tts_ttfa_ms",
                  "reply_complete", "tts_text", "tts_reconstructed", "speech_handle",
-                 "reply_source",
+                 "reply_source", "filler_speech_id",
                  "open_streams", "awaiting_stream_close", "unscoped_audio_bytes",
                 "unscoped_audio_bytes_at_publish", "publication_snapshot_taken",
                  "seq", "finished_at_seq",
@@ -326,6 +326,8 @@ class _TurnState:
         # assistant conversation item can be matched to the speech that made it
         # by identity rather than by guessing from timing.
         self.speech_handle: Any = None
+        # The `say()` whose audio shares this span with a generated answer.
+        self.filler_speech_id: Optional[str] = None
         # How LiveKit created this turn's reply, or `None` while it has no
         # reply at all. Decides which provider stages this turn could ever be
         # the claimant for. marker:r9-reply-source
@@ -365,6 +367,40 @@ class _TurnState:
         # user message, so an uncommitted turn is still collecting the caller's
         # words and a later final belongs to it rather than to a new turn.
         self.user_committed = False
+
+
+def _set_metering_scope(response: Dict[str, Any]) -> None:
+    """Say what the published meter is a measurement *of*.
+
+    `provider_metered_audio_ms` is whatever the recogniser billed against this
+    turn, and two recognisers mean two different things by it. An
+    utterance-metering one (OpenAI) reports the caller's speech. A
+    connection-metering one (Deepgram, flushing every five seconds off frames
+    streamed) reports wall-clock on an open socket, silence included -- and on
+    a live four-turn call three turns had *the entire* published meter arrive
+    after the caller had already stopped talking. Read as speech duration that
+    is not slightly wrong, it is unrelated.
+
+    Publishing `metered_after_final_ms` beside it made the ambiguity visible but
+    left every consumer to rediscover the convention and do the subtraction. So
+    the classification is published too. The amount is never altered: a
+    connection meter is still the number the provider will invoice.
+
+    marker:r12-metering-scope
+    """
+    total = response.get("provider_metered_audio_ms")
+    if not total:
+        return
+    after = response.get("metered_after_final_ms") or 0
+    if after <= 0:
+        # Everything was metered while the caller was still speaking.
+        scope = "utterance"
+    elif after >= total:
+        # Nothing in the meter can be tied to this turn's speech.
+        scope = "connection"
+    else:
+        scope = "mixed"
+    response["metering_scope"] = scope
 
 
 def _is_unanswered_turn(state: "_TurnState", allow_filler: bool = True) -> bool:
@@ -1700,6 +1736,7 @@ class VaaniLiveKitRecorder:
         # says so: as `audio_ms` it read as speech duration and a real merged
         # turn showed 5000ms of "audio" on a 2975ms span.
         response["provider_metered_audio_ms"] = pending.metrics.get("audio_ms")
+        _set_metering_scope(response)
         # The recogniser's token counts are as much a billing fact as its
         # metered audio. Publishing only the audio dropped every token a
         # provider reported *before* the final -- the ordinary case for anything
@@ -1753,6 +1790,7 @@ class VaaniLiveKitRecorder:
             response["provider_metered_audio_ms"] = (
                 (response.get("provider_metered_audio_ms") or 0) + metered
             )
+            _set_metering_scope(response)
         # Summed for the same reason as the audio: each segment of a merged
         # turn was charged separately. marker:r12-tokens-before-final
         for _key in ("input_tokens", "output_tokens"):
@@ -1827,7 +1865,16 @@ class VaaniLiveKitRecorder:
                     and carry.stt is not None
                     and _is_unanswered_turn(
                         carry,
-                        allow_filler=self._pending_stt.started_at_ms is None)):
+                        # Not `started_at_ms`: any VAD interval sets that
+                        # (agent_activity.py:2082), including a cough while the
+                        # callback that issued the filler is still awaiting. The
+                        # old caller's answer is created *after* that callback
+                        # returns, so a VAD-only gate refused the very adoption
+                        # this term exists to allow. A preemptive reply is
+                        # generated from a *transcript*, never from VAD alone,
+                        # so a partial is what marks a genuine next caller.
+                        allow_filler=(
+                            self._pending_stt.first_partial_at_ms is None))):
                 state = carry
         if (state is None
                 and source == "generate_reply"
@@ -1878,11 +1925,18 @@ class VaaniLiveKitRecorder:
             spoken = (state.tts_response.get("audio_ms")
                       if state.tts is not None and not state.tts.ended else None)
             state.tts_response["reply_includes_filler"] = True
+            # Remembered so the filler's *own* later segments can still be
+            # counted. One `say()` can be synthesized in several segments
+            # (tts.py:683) and LiveKit reports each as it finalises, so a filler
+            # straddling the answer's creation had only the segments that had
+            # already landed snapshotted here -- and the rest were silently
+            # added to the answer's share. marker:r12-filler-by-speech
+            state.filler_speech_id = getattr(state.speech_handle, "id", None)
             if spoken:
                 state.tts_response["filler_audio_ms"] = spoken
             else:
                 # Better an admitted unknown than a number that reads as the
-                # answer's own duration.
+                # answer's own duration. Cleared if the meter reports later.
                 state.tts_response["filler_audio_ms_unknown"] = True
             state.tts_response["filler_audio_bytes"] = state.audio_bytes
         self._turns[speech_id] = state
@@ -2364,6 +2418,15 @@ class VaaniLiveKitRecorder:
         # behind a healthy status. Undercounting what a customer is charged for
         # is the least forgivable direction for this number to be wrong in.
         segment_audio_ms = _ms(getattr(metrics, "audio_duration", None))
+        # A segment belonging to the filler is the filler's, whenever it lands.
+        # marker:r12-filler-by-speech
+        if (segment_audio_ms is not None
+                and state.filler_speech_id is not None
+                and getattr(metrics, "speech_id", None) == state.filler_speech_id):
+            state.tts_response["filler_audio_ms"] = (
+                (state.tts_response.get("filler_audio_ms") or 0) + segment_audio_ms
+            )
+            state.tts_response.pop("filler_audio_ms_unknown", None)
         if segment_audio_ms is not None:
             state.tts_response["audio_ms"] = (
                 (state.tts_response.get("audio_ms") or 0) + segment_audio_ms
@@ -2451,6 +2514,7 @@ class VaaniLiveKitRecorder:
                 response["metered_after_final_ms"] = (
                     (response.get("metered_after_final_ms") or 0) + metered
                 )
+                _set_metering_scope(response)
             return
         carried = (pending.metrics or {}).get("audio_ms")
         merged: Dict[str, Any] = {
@@ -2566,16 +2630,26 @@ class VaaniLiveKitRecorder:
                 # capture is off, understated by the same amount.
                 # marker:r12-filler-words-kept
                 merge = bool(state.tts_response.get("reply_includes_filler"))
+                prior = state.tts_response.get("text") if self._capture_transcripts else None
+                # `text in prior` means this item has already been recorded --
+                # not that it replaces what is there. Falling through to a plain
+                # assignment discarded the filler's words whenever the answer
+                # happened to be a substring of them, which is the same silent
+                # loss this block was added to stop.
+                already = bool(merge and prior and text in prior)
                 if self._capture_transcripts:
-                    prior = state.tts_response.get("text")
                     state.tts_response["text"] = (
-                        f"{prior} {text}" if merge and prior and text not in prior
-                        else text
+                        f"{prior} {text}" if merge and prior and not already
+                        else prior if already else text
                     )
-                state.tts_response["char_count"] = (
-                    (state.tts_response.get("char_count") or 0) + len(text)
-                    if merge else len(text)
-                )
+                if already:
+                    pass
+                elif merge:
+                    state.tts_response["char_count"] = (
+                        (state.tts_response.get("char_count") or 0) + len(text)
+                    )
+                else:
+                    state.tts_response["char_count"] = len(text)
             # LiveKit knows whether the reply was cut off; the TTS plugin's own
             # `cancelled` flag does not survive every interruption path.
             if getattr(item, "interrupted", None):

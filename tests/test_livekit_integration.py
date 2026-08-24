@@ -138,9 +138,16 @@ class FakeSpeechHandle:
     from timing.
     """
 
-    def __init__(self, handle_id: str):
+    def __init__(self, handle_id: str, scheduled: bool = True):
         self.id = handle_id
         self.chat_items: list = []
+        # LiveKit schedules a generated reply in the same synchronous frame as
+        # `speech_created` (`agent_activity.py:1575` -> `_mark_scheduled`), so
+        # by the time anything reads the handle an ordinary reply says True.
+        # Preemptive generation is the exception: it passes
+        # `schedule_speech=False` and stays unscheduled until the predicted
+        # turn is validated, which is what tells the two apart.
+        self.scheduled = scheduled
 
     def add_done_callback(self, callback):  # pragma: no cover - not used here
         self._done = callback
@@ -4177,6 +4184,155 @@ async def test_a_contested_turns_token_count_carries_the_caveat_with_no_tts_span
     assert llm[0]["response"].get("reply_attribution") == "inferred", (
         "an uncertain turn's tokens must not read as settled just because the "
         "reply never got as far as speaking"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_interim_does_not_detach_the_answer_from_its_question(
+        recorder):
+    """A reply LiveKit scheduled answers the turn it was scheduled for.
+
+    A preflight transcript and an ordinary interim arrive as the same public
+    event, so while a filler is playing there is no way to tell a reply meant
+    for the *next* caller from this caller's own delayed answer. Refusing both
+    filed measured tokens in a turn with no question in it, and left the
+    question reading as unanswered: one exchange described wrongly twice, with
+    the cost on the wrong side of it.
+
+    The handle settles it. An ordinary reply is scheduled in the same
+    synchronous frame as `speech_created`, a preemptive one is not, so the
+    decision only has to wait until this handler returns. It is deliberately
+    read here *before* the loop gets a slice -- the LLM metric is emitted
+    immediately -- because the answer must not depend on which arrives first.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    rec.note_audio_tap_installed()
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("question one", True))
+    session.emit("conversation_item_added", chat_item("user", "question one"))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("filler"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    # An ordinary interim, indistinguishable from a preflight in the events.
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("um", False))
+    # Caller one's own answer, scheduled the moment it was created.
+    session.emit("speech_created", speech_created(FakeSpeechHandle("old-answer")))
+    session.emit("metrics_collected", llm_metrics("old-answer"))
+    await rec.finish()
+
+    ops = operations(read_events(_dir(rec)))
+    stt = next(op for op in ops if op["type"] == "stt"
+               and "question one" in (op["response"].get("transcript") or ""))
+    llm = next(op for op in ops if op["type"] == "llm")
+    assert llm["response"].get("total_tokens"), (
+        "guard: this test is meaningless unless the tokens were measured"
+    )
+    assert llm["turn_id"] == stt["turn_id"], (
+        "the tokens LiveKit measured for this reply must be filed against the "
+        "question it was scheduled to answer, not a turn with no question in it"
+    )
+    assert llm["response"].get("reply_attribution") is None, (
+        "the handle said who this reply belongs to, so the turn must not be "
+        "marked as a judgement"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_preemptive_reply_over_a_filler_still_gets_its_own_turn(recorder):
+    """The other half of the same reading, which must not regress.
+
+    An unscheduled reply was generated from a *predicted* end of the speech
+    that arrived over the filler, so it answers the next caller. Merging it
+    backwards would report their words as answered before they were spoken.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    rec.note_audio_tap_installed()
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("question one", True))
+    session.emit("conversation_item_added", chat_item("user", "question one"))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("filler"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("and to Boston", False))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("next-answer", scheduled=False)))
+    session.emit("metrics_collected", llm_metrics("next-answer"))
+    await rec.finish()
+
+    ops = operations(read_events(_dir(rec)))
+    stt = next(op for op in ops if op["type"] == "stt"
+               and "question one" in (op["response"].get("transcript") or ""))
+    llm = next(op for op in ops if op["type"] == "llm")
+    assert llm["turn_id"] != stt["turn_id"], (
+        "a reply predicted for the next caller must not be merged into the "
+        "previous caller's turn"
+    )
+    assert llm["response"].get("reply_attribution") is None, (
+        "the handle said this reply was preemptive, so keeping it separate is a "
+        "reading rather than a judgement and must not be hedged"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_contested_turns_derived_llm_span_carries_the_caveat_too(recorder):
+    """The caveat is documented as covering that turn's spans, not one of them.
+
+    When no LLM plugin emits `metrics_collected`, the span is reconstructed
+    from `conversation_item_added` instead. That path publishes an `ok` LLM
+    operation with a first-token latency on it, and it was the one publisher
+    the disclosure never reached -- so an adopter comparing per-turn LLM
+    latency saw a clean number for a reply that may answer a different turn.
+    There are no tokens here, but a latency drawn from the wrong turn is wrong
+    in exactly the same way, for free.
+
+    The reply here comes from a build whose speech handle does not report
+    whether it is scheduled, which is the only case left where the ownership
+    really is a judgement -- and therefore the case where the disclosure has to
+    reach every publisher.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("What is the fare?", True))
+    session.emit("conversation_item_added", chat_item("user", "What is the fare?"))
+    session.emit("speech_created",
+                 speech_created(SimpleNamespace(id="filler-1"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("And to Boston?", False))
+    # No `scheduled` on this handle: an older build, where the reply's owner
+    # cannot be read and the turn has to say so.
+    answer = SimpleNamespace(id="answer-2", chat_items=[])
+    assert not hasattr(answer, "scheduled"), (
+        "guard: this test only covers the fallback while the handle stays silent"
+    )
+    session.emit("speech_created", speech_created(answer))
+    # No `metrics_collected` for the LLM at all: the span has to be derived.
+    # The item is linked to its speech the way LiveKit links it, so the reply
+    # is matched by identity and the derived span is actually reached.
+    item = chat_item("assistant", "It is thirty dollars.", {"llm_node_ttft": 0.3})
+    answer.chat_items.append(item.item)
+    session.emit("conversation_item_added", item)
+    await rec.finish()
+
+    llm = [op for op in operations(read_events(_dir(rec))) if op["type"] == "llm"]
+    assert llm, "the derived LLM span must still be published"
+    assert llm[0]["response"].get("estimated") is True, (
+        "guard: this test is meaningless unless it exercised the derived path"
+    )
+    assert llm[0]["response"].get("reply_attribution") == "inferred", (
+        "a derived span on a contested turn must disclose the same doubt the "
+        "measured one does, or the caveat depends on which plugin you use"
     )
 
 

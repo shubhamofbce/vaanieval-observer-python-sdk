@@ -539,6 +539,11 @@ class VaaniLiveKitRecorder:
         # `_all_turns` is the deduplicated list to iterate and count.
         self._turns: Dict[str, _TurnState] = {}
         self._all_turns: List[_TurnState] = []
+        # speech id -> the deferred contested decision waiting on its handle.
+        # Settled by whoever needs the turn first, so the answer never depends
+        # on whether the loop got a slice before the next event arrived.
+        self._contested_pending: Dict[str, Any] = {}
+        self._contested_events: Dict[str, Any] = {}
         self._pending_turn: Optional[_TurnState] = None
         # The turn still collecting the caller's words. Distinct from
         # `_pending_turn`, which `speech_created` consumes: LiveKit creates a
@@ -1833,6 +1838,7 @@ class VaaniLiveKitRecorder:
         # the turn eligible to claim an LLM measurement rather than silently
         # narrowing the field on a build whose events say something new.
         source = getattr(event, "source", None) or "generate_reply"
+        self._settle_pending(speech_id)
         if speech_id in self._turns:
             self._turns[speech_id].speech_handle = getattr(event, "speech_handle", None)
             self._turns[speech_id].reply_source = source
@@ -1893,27 +1899,27 @@ class VaaniLiveKitRecorder:
             # both surface as `user_input_transcribed(is_final=False)`, because
             # `audio_recognition.py:1269` and `:1310` call the same hook.
             #
-            # The *speech handle* does distinguish them, but not yet at this
+            # The *speech handle* does distinguish them, just not yet at this
             # point in the call. Preemptive generation is created with
             # `_generate_reply(schedule_speech=False)` (`agent_activity.py:2303`)
             # and stays unscheduled until the user turn completes and the
             # prediction is validated (`:2533`); an ordinary reply takes the
-            # default and is marked synchronously at `:1575-1576`. Both are
-            # still unscheduled *inside* this handler, because `speech_created`
-            # is emitted at `:1536`, before either -- so reading
-            # `handle.scheduled` here returns False for both. Using it means
-            # deferring this binding by an event-loop iteration, which is
-            # tracked as follow-up work rather than done here.
-            #
-            # Until then, refusing is the safer default: adopting a next
-            # caller's reply backwards merges two exchanges, so their words
-            # appear answered before they were spoken. Refusing keeps both
-            # exchanges present and separately inspectable. It is a judgement,
-            # so the turn that results says so instead of reading as a fact.
+            # default and is marked scheduled in the same synchronous frame
+            # (`:1575-1576` -> `_schedule_speech` -> `_mark_scheduled`,
+            # `:1710`). Both are still unscheduled *inside* this handler,
+            # because `speech_created` is emitted first, at `:1536` -- so the
+            # answer exists one event-loop iteration later, and this decision
+            # waits that long for it rather than guessing.
             contested = adoptable and self._pending_stt.first_partial_at_ms is not None
             if adoptable and _is_unanswered_turn(carry, allow_filler=not contested):
                 state = carry
             elif contested:
+                if self._defer_contested_reply(event, speech_id, source, carry):
+                    return
+                # No loop to defer onto, or a handle that does not report
+                # whether it is scheduled: fall back to refusing, which keeps
+                # both exchanges present and separately inspectable, and say on
+                # the turn that it was a judgement rather than a reading.
                 reply_contested = True
         if (state is None
                 and source == "generate_reply"
@@ -1941,8 +1947,19 @@ class VaaniLiveKitRecorder:
             # `say()` and the opening greeting produce a turn with no user
             # speech at all.
             state = self._new_turn()
+        self._bind_reply(state, event, speech_id, source,
+                         contested=reply_contested)
+
+    def _bind_reply(self, state: "_TurnState", event: Any, speech_id: str,
+                    source: str, *, contested: bool) -> None:
+        """Attach a reply speech to the turn that was chosen for it.
+
+        Shared with the deferred settlement below so a decision taken one event
+        loop iteration later goes through exactly the same binding, rather than
+        a second copy of it that drifts.
+        """
         self._pending_turn = None
-        if reply_contested:
+        if contested:
             # Held on the turn rather than written straight into
             # `tts_response`: a reply can report LLM tokens and then be
             # interrupted before any TTS metric exists, and the caveat has to
@@ -2004,6 +2021,92 @@ class VaaniLiveKitRecorder:
         self._speaking_turn = state
         self._harvest_speech_text(getattr(event, "speech_handle", None), state)
 
+    def _defer_contested_reply(self, event: Any, speech_id: str, source: str,
+                               carry: "_TurnState") -> bool:
+        """Wait one event-loop iteration for LiveKit to say who this reply is for.
+
+        A preflight transcript and an ordinary interim reach us as the same
+        event, so at `speech_created` there is nothing to tell a reply aimed at
+        the *next* caller from the answer to the one whose filler is playing.
+        `SpeechHandle.scheduled` does tell them apart, but only just after this
+        handler returns, so the choice is made there instead of guessed here.
+
+        Returns True when the decision was deferred. Nothing is bound in the
+        meantime, which leaves the previous turn current for that one iteration
+        -- the same turn any event between the filler and this reply would have
+        landed on anyway. Every LiveKit event that could claim this speech
+        arrives from a later await, so there is nothing to race.
+        """
+        handle = getattr(event, "speech_handle", None)
+        if not hasattr(handle, "scheduled"):
+            # A build whose handle says nothing about scheduling: better the
+            # admitted judgement than a decision read off an absent attribute.
+            return False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+        settle = _guard(
+            self, "speech_created:contested",
+            lambda evt: self._settle_contested_reply(evt, speech_id, source, carry),
+        )
+        self._contested_events[speech_id] = event
+        try:
+            loop.call_soon(settle, event)
+        except RuntimeError:  # pragma: no cover - loop closed mid-call
+            return False
+        self._contested_pending[speech_id] = settle
+        return True
+
+    def _settle_pending(self, speech_id: Optional[str]) -> None:
+        """Settle a deferred reply before anything reads the turn it belongs to.
+
+        The loop slice is the normal trigger, but a consumer can get there
+        first. Resolving on demand keeps the decision out of the ordering: a
+        metric that arrives early settles it and then finds the turn already
+        chosen, instead of opening a second one that can never be merged back
+        because its operation has been written.
+        """
+        if not speech_id:
+            return
+        settle = self._contested_pending.pop(speech_id, None)
+        if settle is not None:
+            settle(self._contested_events.pop(speech_id, None))
+
+    def _settle_contested_reply(self, event: Any, speech_id: str, source: str,
+                                carry: "_TurnState") -> None:
+        """Bind a deferred reply now that its handle has been read.
+
+        Scheduled means LiveKit created this reply because the caller's turn
+        completed, so it answers `carry`. Unscheduled means it was generated
+        from a *predicted* end of the speech that arrived over the filler, so it
+        answers that next caller and belongs in its own turn. Either way the
+        answer is read rather than inferred, so no caveat is recorded.
+        """
+        self._contested_pending.pop(speech_id, None)
+        self._contested_events.pop(speech_id, None)
+        if speech_id in self._turns:
+            # Something claimed this speech while the decision was pending --
+            # a metric carrying its id registers the turn itself. Whatever it
+            # chose stands; a second binding here would move the turn under it.
+            return
+        handle = getattr(event, "speech_handle", None)
+        if bool(getattr(handle, "scheduled", False)):
+            if _is_unanswered_turn(carry, allow_filler=True):
+                self._bind_reply(carry, event, speech_id, source, contested=False)
+                return
+            # Ordinary, but the turn it would have answered has since been
+            # answered: this is a new exchange, not a contested one.
+            self._bind_reply(self._new_turn(), event, speech_id, source,
+                             contested=False)
+            return
+        # Unscheduled: a preemptive reply, tracked as one so a cancelled
+        # attempt's empty turn is reused rather than left behind as a phantom.
+        reuse = self._preemptive_turn
+        state = reuse if reuse is not None and _is_empty_turn(reuse) else self._new_turn()
+        self._preemptive_turn = state
+        self._bind_reply(state, event, speech_id, source, contested=False)
+
     def open_output_stream(self) -> "_OutputStream":
         """A handle identifying one `tts_node` invocation.
 
@@ -2045,6 +2148,7 @@ class VaaniLiveKitRecorder:
             # LLM round-trip before it yields anything, and until its stream is
             # counted the turn looks idle -- so the next `speech_created`
             # retires and closes a reply that is still about to speak.
+            self._settle_pending(stream.speech_id)
             if self._pin_stream(stream, self._turns.get(stream.speech_id)) is None:
                 self._defer_stream(stream)
         return stream
@@ -2136,6 +2240,7 @@ class VaaniLiveKitRecorder:
         if stream.speech_id is not None:
             # Identity, not timing. `None` here means the turn has not been
             # registered yet, which is a wait -- never a licence to guess.
+            self._settle_pending(stream.speech_id)
             owner = self._pin_stream(stream, self._turns.get(stream.speech_id))
             if owner is None:
                 self._defer_stream(stream)
@@ -3026,6 +3131,11 @@ class VaaniLiveKitRecorder:
                 # Absent, not zero. Reporting zero tokens would corrupt every
                 # cost and throughput aggregate built on top of this package.
                 estimated=True,
+                # The caveat is documented as covering that turn's spans, so it
+                # has to travel with this one too. This path carries no tokens,
+                # but a per-turn latency comparison drawn from a reply that may
+                # belong to another turn is wrong in the same way for free.
+                **(state.reply_attribution or {}),
             ),
             ended_at_ms=ended_at,
         )
@@ -3278,6 +3388,7 @@ class VaaniLiveKitRecorder:
             # whichever reply is speaking now -- during a barge-in, the wrong
             # one. Reusing it would dress a guess up as identity.
             return self._unidentified_metric_turn(stage)
+        self._settle_pending(speech_id)
         existing = self._turns.get(speech_id)
         if existing is not None:
             self._current_turn = existing

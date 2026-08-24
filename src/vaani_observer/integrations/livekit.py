@@ -433,6 +433,46 @@ def _set_metering_scope(response: Dict[str, Any]) -> None:
     )
 
 
+def _reply_origin(event: Any, handle: Any) -> str:
+    """Say which caller a reply was created for, or admit that it is unknown.
+
+    `scheduled` alone is queue state, not provenance. Three code paths build a
+    `SpeechCreatedEvent` with `source="generate_reply"`, and only one of them is
+    the answer to the user turn that just completed:
+
+    * the automatic reply to a completed turn is scheduled at once, reports
+      `user_initiated=True` and carries audio input details
+      (`agent_activity.py:2574` on 1.7.0, `:2553` on 1.6.10);
+    * preemptive generation passes `schedule_speech=False` and stays unscheduled
+      until its predicted turn is validated (`:2321` / `:2303`);
+    * a realtime model's server-side generation is scheduled immediately but
+      reports `user_initiated=False` (`:2007` / `:1983`). It answers the speech
+      being transcribed *now* -- the framework even notes the final transcript
+      may arrive after the reply it prompted -- so it belongs with that speech,
+      exactly like a preemptive one.
+
+    `AgentSession.generate_reply()` is the case that stays unknown. It is
+    scheduled and `user_initiated=True` like the automatic reply, and only its
+    input modality differs, defaulting to `"text"`. An application may call it to
+    answer the caller or to say something unrelated, and nothing in the event
+    distinguishes those, so the turn says so rather than picking one.
+    """
+    scheduled = getattr(handle, "scheduled", None)
+    if scheduled is None:
+        return "unknown"
+    if not scheduled:
+        return "in_flight_speech"
+    user_initiated = getattr(event, "user_initiated", None)
+    if user_initiated is None:
+        return "unknown"
+    if not user_initiated:
+        return "in_flight_speech"
+    modality = getattr(getattr(handle, "input_details", None), "modality", None)
+    if modality != "audio":
+        return "unknown"
+    return "completed_turn"
+
+
 def _is_unanswered_turn(state: "_TurnState", allow_filler: bool = True) -> bool:
     """True when a turn has the caller's words but nothing said back yet.
 
@@ -1968,10 +2008,13 @@ class VaaniLiveKitRecorder:
                 "reply_attribution": "inferred",
                 "reply_attribution_reason": (
                     "a partial transcript arrived while the previous turn's "
-                    "filler was still playing. LiveKit reports a preflight "
-                    "transcript and an ordinary interim as the same event, so "
-                    "this reply was kept separate rather than merged into that "
-                    "turn; it may in fact answer it"
+                    "filler was still playing, and this reply's origin could "
+                    "not be established: it was not the automatic answer to a "
+                    "completed user turn, a preemptive generation or a realtime "
+                    "server generation, so it is most likely an application "
+                    "call to generate_reply(). It was kept in its own turn "
+                    "rather than merged into the one still collecting; it may "
+                    "in fact answer it"
                 ),
             }
             state.tts_response.update(state.reply_attribution)
@@ -2091,21 +2134,29 @@ class VaaniLiveKitRecorder:
             # chose stands; a second binding here would move the turn under it.
             return
         handle = getattr(event, "speech_handle", None)
-        if bool(getattr(handle, "scheduled", False)):
+        origin = _reply_origin(event, handle)
+        if origin == "completed_turn":
             if _is_unanswered_turn(carry, allow_filler=True):
                 self._bind_reply(carry, event, speech_id, source, contested=False)
                 return
-            # Ordinary, but the turn it would have answered has since been
-            # answered: this is a new exchange, not a contested one.
+            # The turn it would have answered has since been answered: this is a
+            # new exchange, not a contested one.
             self._bind_reply(self._new_turn(), event, speech_id, source,
                              contested=False)
             return
-        # Unscheduled: a preemptive reply, tracked as one so a cancelled
-        # attempt's empty turn is reused rather than left behind as a phantom.
-        reuse = self._preemptive_turn
-        state = reuse if reuse is not None and _is_empty_turn(reuse) else self._new_turn()
-        self._preemptive_turn = state
-        self._bind_reply(state, event, speech_id, source, contested=False)
+        if origin == "in_flight_speech":
+            # Generated for the speech still arriving, whose final transcript
+            # lands after it. Tracked as preemptive so that transcript joins
+            # this turn, and so a cancelled attempt's empty turn is reused
+            # rather than left behind as a phantom.
+            reuse = self._preemptive_turn
+            state = reuse if reuse is not None and _is_empty_turn(reuse) else self._new_turn()
+            self._preemptive_turn = state
+            self._bind_reply(state, event, speech_id, source, contested=False)
+            return
+        # Unknown provenance. Kept separate *and* marked, because separating is
+        # itself a choice that can be wrong.
+        self._bind_reply(self._new_turn(), event, speech_id, source, contested=True)
 
     def open_output_stream(self) -> "_OutputStream":
         """A handle identifying one `tts_node` invocation.

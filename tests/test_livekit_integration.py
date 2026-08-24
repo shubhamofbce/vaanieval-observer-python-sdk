@@ -138,9 +138,15 @@ class FakeSpeechHandle:
     from timing.
     """
 
-    def __init__(self, handle_id: str, scheduled: bool = True):
+    def __init__(self, handle_id: str, scheduled: bool = True,
+                 modality: str = "audio"):
         self.id = handle_id
         self.chat_items: list = []
+        # `SpeechHandle.create` defaults to audio input details, and the
+        # automatic reply to a completed turn passes them explicitly.
+        # `AgentSession.generate_reply()` defaults to "text", which is what
+        # separates an application's own reply from the framework's.
+        self.input_details = SimpleNamespace(modality=modality)
         # LiveKit schedules a generated reply in the same synchronous frame as
         # `speech_created` (`agent_activity.py:1575` -> `_mark_scheduled`), so
         # by the time anything reads the handle an ordinary reply says True.
@@ -153,8 +159,12 @@ class FakeSpeechHandle:
         self._done = callback
 
 
-def speech_created(handle, source: str = "generate_reply"):
-    return SimpleNamespace(speech_handle=handle, source=source)
+def speech_created(handle, source: str = "generate_reply",
+                   user_initiated: bool = True):
+    # A realtime model's server-side generation is the one that reports
+    # `user_initiated=False`; every other speech LiveKit creates reports True.
+    return SimpleNamespace(speech_handle=handle, source=source,
+                           user_initiated=user_initiated)
 
 
 @pytest.fixture
@@ -4108,20 +4118,21 @@ async def test_a_finished_filler_turn_does_not_adopt_the_next_callers_reply(reco
 
 
 @pytest.mark.asyncio
-async def test_a_reply_kept_out_of_a_filler_turn_admits_it_might_belong_there(recorder):
+async def test_a_reply_the_application_asked_for_admits_it_might_answer_the_caller(recorder):
     """The one thing this must never be is silent.
 
-    LiveKit reports a preflight transcript and an ordinary interim through the
-    same public event (`audio_recognition.py:1269` and `:1310` call the same
-    hook), and only preflight starts a preemptive generation -- which is not
-    observable at all. So when a partial arrives while a filler is playing,
-    "this reply belongs to the next caller" and "this reply answers the caller
-    whose filler is playing" are indistinguishable, and preemptive generation is
-    on by default, so both really happen.
+    Three of the four ways a reply is created say who they are for: the
+    automatic answer to a completed turn is scheduled, `user_initiated` and
+    audio-modality; a preemptive generation is unscheduled; a realtime model's
+    server-side generation is not `user_initiated`. The fourth --
+    `AgentSession.generate_reply()` -- is scheduled and `user_initiated` like
+    the automatic answer, and differs only in defaulting to text modality. An
+    application may call it to answer the caller, or to say something unrelated,
+    and nothing in the event tells them apart.
 
-    The recorder keeps the reply separate, because merging two exchanges makes a
-    caller's words appear answered before they were spoken. But it is a guess,
-    and a reader deciding a latency from it is owed that.
+    The recorder keeps such a reply separate, because merging two exchanges
+    makes a caller's words appear answered before they were spoken. But that is
+    a guess, and a reader deciding a latency from it is owed that.
     """
     rec = recorder()
     session = FakeAgentSession()
@@ -4130,13 +4141,15 @@ async def test_a_reply_kept_out_of_a_filler_turn_admits_it_might_belong_there(re
     session.emit("user_input_transcribed", transcript("What is the fare?", True))
     session.emit("conversation_item_added", chat_item("user", "What is the fare?"))
     session.emit("speech_created",
-                 speech_created(SimpleNamespace(id="filler-1"), source="say"))
+                 speech_created(FakeSpeechHandle("filler-1"), source="say"))
     session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
     rec.tap_output_frame(agent_frame(400))
-    # Someone speaks while the filler plays. Nothing here says who.
+    # Someone speaks while the filler plays, and the application generates a
+    # reply of its own. Nothing here says which of the two it is for.
     session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
     session.emit("user_input_transcribed", transcript("And to Boston?", False))
-    session.emit("speech_created", speech_created(SimpleNamespace(id="answer-2")))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("answer-2", modality="text")))
     session.emit("metrics_collected", tts_metrics("answer-2", audio_duration=2.0))
     rec.tap_output_frame(agent_frame(2000))
     await rec.finish()
@@ -4146,7 +4159,7 @@ async def test_a_reply_kept_out_of_a_filler_turn_admits_it_might_belong_there(re
     assert tts, "the reply must be recorded whichever turn it lands in"
     response = tts[0]["response"]
     assert response.get("reply_attribution") == "inferred"
-    assert "preflight" in (response.get("reply_attribution_reason") or ""), (
+    assert "generate_reply" in (response.get("reply_attribution_reason") or ""), (
         "the reason must name what could not be distinguished, so a reader can "
         "judge it rather than take our word for it"
     )
@@ -4277,6 +4290,62 @@ async def test_a_preemptive_reply_over_a_filler_still_gets_its_own_turn(recorder
     )
     assert llm["response"].get("reply_attribution") is None, (
         "the handle said this reply was preemptive, so keeping it separate is a "
+        "reading rather than a judgement and must not be hedged"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_realtime_models_own_reply_is_not_merged_into_the_previous_caller(recorder):
+    """Scheduled does not mean "answers the turn that just finished".
+
+    A realtime model generates server-side as it transcribes. LiveKit surfaces
+    that as a `speech_created` with `user_initiated=False`, scheduled at once
+    (`agent_activity.py:2007` on 1.7.0, `:1983` on 1.6.10) -- and it answers the
+    speech being transcribed *now*, not the previous one. The framework itself
+    notes at `:1978-1989` that a provider may withhold the final transcript
+    until that reply has finished generating, so the reply legitimately arrives
+    before the words that prompted it.
+
+    Reading `scheduled` alone would merge it backwards into the previous
+    caller's turn and, worse, report that as certain.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    rec.note_audio_tap_installed()
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("question one", True))
+    session.emit("conversation_item_added", chat_item("user", "question one"))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("filler"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("and to Boston", False))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("realtime-answer"),
+                                user_initiated=False))
+    session.emit("metrics_collected", llm_metrics("realtime-answer"))
+    # The provider releases the final transcript only now, after its reply.
+    session.emit("user_input_transcribed", transcript("and to Boston", True))
+    session.emit("conversation_item_added", chat_item("user", "and to Boston"))
+    await rec.finish()
+
+    ops = operations(read_events(_dir(rec)))
+    first = next(op for op in ops if op["type"] == "stt"
+                 and "question one" in (op["response"].get("transcript") or ""))
+    second = next(op for op in ops if op["type"] == "stt"
+                  and "and to Boston" in (op["response"].get("transcript") or ""))
+    llm = next(op for op in ops if op["type"] == "llm")
+    assert llm["turn_id"] != first["turn_id"], (
+        "a realtime reply generated for the caller now speaking must not be "
+        "merged into the previous caller's turn"
+    )
+    assert llm["turn_id"] == second["turn_id"], (
+        "it belongs with the words that prompted it, which arrive after it"
+    )
+    assert llm["response"].get("reply_attribution") is None, (
+        "the event said this reply was not user-initiated, so placing it is a "
         "reading rather than a judgement and must not be hedged"
     )
 

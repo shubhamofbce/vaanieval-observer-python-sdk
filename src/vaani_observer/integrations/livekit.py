@@ -266,7 +266,8 @@ class _TurnState:
                  "tts_response", "tts_ended_at", "tools", "audio_bytes",
                  "audio_first_at_ms", "finished", "tts_derived", "tts_ttfa_ms",
                  "reply_complete", "tts_text", "tts_reconstructed", "speech_handle",
-                 "reply_source", "filler_speech_id", "recorded_item_ids",
+                 "reply_source", "reply_attribution",
+                 "filler_speech_id", "recorded_item_ids",
                  "open_streams", "awaiting_stream_close", "unscoped_audio_bytes",
                 "unscoped_audio_bytes_at_publish", "publication_snapshot_taken",
                  "seq", "finished_at_seq",
@@ -338,6 +339,11 @@ class _TurnState:
         # reply at all. Decides which provider stages this turn could ever be
         # the claimant for.
         self.reply_source: Optional[str] = None
+        # Attribution uncertainty belongs to the *turn*, not to one span: a
+        # reply can report LLM tokens and then be interrupted before any TTS
+        # metric exists, and the caveat has to reach the expensive number
+        # either way.
+        self.reply_attribution: Optional[Dict[str, Any]] = None
         # How many `tts_node` generators are still able to render for this
         # reply. A span closed while one is open publishes a duration shorter
         # than the audio the caller heard, and the frames that arrive after it
@@ -624,9 +630,6 @@ class VaaniLiveKitRecorder:
         # True once any stream had to be bound by timing because LiveKit's
         # speech-handle context was unavailable.
         self._stream_ownership_inferred: bool = False
-        # Set when a reply was kept out of a filler-only turn on evidence that
-        # cannot distinguish the next caller from the current one.
-        self._reply_attribution_contested: bool = False
         self._tail_written_off_ms: int = 0
         self._tail_written_off_turns: List[str] = []
 
@@ -1862,6 +1865,10 @@ class VaaniLiveKitRecorder:
             # only happen after a preemptive reply was merged below, and a
             # second, unrelated speech must not quietly join it.
             state = None
+        # Deliberately a local. As recorder state it survived a `_guard`-
+        # swallowed failure between being set and being consumed, and stamped
+        # the caveat onto the next, innocent turn.
+        reply_contested = False
         if state is None:
             # LiveKit answers a *provisional* end of turn: it creates a reply
             # for each final transcript and cancels the ones the caller talked
@@ -1881,25 +1888,33 @@ class VaaniLiveKitRecorder:
                          and source == "generate_reply"
                          and carry.stt is not None)
             # Whether this reply belongs to the caller whose filler is playing,
-            # or to a *next* caller who spoke over it, is not decidable from the
-            # events LiveKit makes public. A preflight transcript and an
-            # ordinary interim both surface as
-            # `user_input_transcribed(is_final=False)` --
-            # `audio_recognition.py:1269` and `:1310` call the same hook -- and
-            # only preflight additionally starts a preemptive generation, which
-            # is not observable. Preemptive generation is on by default, so both
-            # readings are live and no gate can separate them.
+            # or to a *next* caller who spoke over it, cannot be read from the
+            # events themselves: a preflight transcript and an ordinary interim
+            # both surface as `user_input_transcribed(is_final=False)`, because
+            # `audio_recognition.py:1269` and `:1310` call the same hook.
             #
-            # Refusing is the safer default: adopting a next caller's reply
-            # backwards merges two exchanges, so their words appear answered
-            # before they were spoken. Refusing keeps both exchanges present and
-            # separately inspectable. But it is a guess either way, so the turn
-            # that results says so instead of reading as a fact.
+            # The *speech handle* does distinguish them, but not yet at this
+            # point in the call. Preemptive generation is created with
+            # `_generate_reply(schedule_speech=False)` (`agent_activity.py:2303`)
+            # and stays unscheduled until the user turn completes and the
+            # prediction is validated (`:2533`); an ordinary reply takes the
+            # default and is marked synchronously at `:1575-1576`. Both are
+            # still unscheduled *inside* this handler, because `speech_created`
+            # is emitted at `:1536`, before either -- so reading
+            # `handle.scheduled` here returns False for both. Using it means
+            # deferring this binding by an event-loop iteration, which is
+            # tracked as follow-up work rather than done here.
+            #
+            # Until then, refusing is the safer default: adopting a next
+            # caller's reply backwards merges two exchanges, so their words
+            # appear answered before they were spoken. Refusing keeps both
+            # exchanges present and separately inspectable. It is a judgement,
+            # so the turn that results says so instead of reading as a fact.
             contested = adoptable and self._pending_stt.first_partial_at_ms is not None
             if adoptable and _is_unanswered_turn(carry, allow_filler=not contested):
                 state = carry
             elif contested:
-                self._reply_attribution_contested = True
+                reply_contested = True
         if (state is None
                 and source == "generate_reply"
                 and self._pending_stt.started_at_ms is not None):
@@ -1927,21 +1942,22 @@ class VaaniLiveKitRecorder:
             # speech at all.
             state = self._new_turn()
         self._pending_turn = None
-        if self._reply_attribution_contested:
-            # The reply was filed in a turn of its own because a partial arrived
-            # while a filler was playing, and LiveKit does not expose enough to
-            # tell whose partial it was. Recorded on the turn so a reader sees
-            # the uncertainty attached to the number, rather than a detached
-            # answer that reads as an established fact.
-            self._reply_attribution_contested = False
-            state.tts_response["reply_attribution"] = "inferred"
-            state.tts_response["reply_attribution_reason"] = (
-                "a partial transcript arrived while the previous turn's filler "
-                "was still playing. LiveKit reports a preflight transcript and "
-                "an ordinary interim as the same event, so this reply was kept "
-                "separate rather than merged into that turn; it may in fact "
-                "answer it"
-            )
+        if reply_contested:
+            # Held on the turn rather than written straight into
+            # `tts_response`: a reply can report LLM tokens and then be
+            # interrupted before any TTS metric exists, and the caveat has to
+            # reach the expensive number either way.
+            state.reply_attribution = {
+                "reply_attribution": "inferred",
+                "reply_attribution_reason": (
+                    "a partial transcript arrived while the previous turn's "
+                    "filler was still playing. LiveKit reports a preflight "
+                    "transcript and an ordinary interim as the same event, so "
+                    "this reply was kept separate rather than merged into that "
+                    "turn; it may in fact answer it"
+                ),
+            }
+            state.tts_response.update(state.reply_attribution)
         # A filler said *inside* `on_user_turn_completed` is spoken after the
         # caller's message is committed and before LiveKit generates the real
         # answer, so nothing at the time it is said can tell it from a scripted
@@ -2366,6 +2382,12 @@ class VaaniLiveKitRecorder:
                 total_tokens=getattr(metrics, "total_tokens", None),
                 tokens_per_second=getattr(metrics, "tokens_per_second", None),
                 ttft_ms=ttft,
+                # If this turn's ownership is uncertain, the tokens are the
+                # most expensive thing on it. A reply can report LLM metrics
+                # and then be interrupted before any TTS metric exists, so
+                # carrying the caveat only on the TTS span left exactly this
+                # number looking settled.
+                **(state.reply_attribution or {}),
             ),
             ended_at_ms=ended_at,
         )

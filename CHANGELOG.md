@@ -7,7 +7,32 @@ here is what a bug report is tied back to. Entries describe what changed about
 ## 0.5.0
 
 A sixth review pass over the 0.4.0 fixes, which found four further defects of
-the same silent kind. One field changed meaning, hence the minor bump.
+the same silent kind, and a seventh pass over *those* fixes, which found two
+more. One field changed meaning, hence the minor bump.
+
+### A caveat that never reached the expensive number
+
+Attribution uncertainty was written onto the TTS span. A reply can report LLM
+token counts and then be interrupted before any TTS metric, audio frame or
+assistant item exists — in which case the turn published an `ok` LLM operation,
+with prompt and completion tokens on it, and nothing anywhere saying its
+ownership was a judgement call. The caveat now belongs to the turn and is
+stamped on every operation it publishes.
+
+### A swallowed error could hedge an innocent turn
+
+The contested marker lived on the recorder, set in one place and cleared in
+another. Handler exceptions are deliberately swallowed so a call keeps
+recording, so a transient failure in between left the marker set and the next,
+unrelated utterance was published carrying someone else's uncertainty. It is now
+a local variable, which removes the failure mode rather than guarding it.
+
+### Opening a call changed its turn count
+
+The session list counts one LiveKit message committed as two turn rows as a
+single exchange. The call view counted rows, so opening a one-turn call showed
+two. Both rows are still listed — the inspector needs them — but the headline
+and the live rail now count exchanges, and say how many rows continue another.
 
 ### A spoken sentence could be dropped from the transcript
 
@@ -47,13 +72,22 @@ itself, so it travels with the number rather than living only in these docs.
 
 If a partial transcript arrives while a filler is playing, the reply that
 follows is kept in a turn of its own. That is the safe choice — merging would
-show a caller answered before they spoke — but it is a *guess*: LiveKit reports
-a preflight transcript from a second speaker and an ordinary interim from the
-current one through the same event, and preemptive generation is on by default,
-so both really occur. The span now carries `reply_attribution: "inferred"` and a
-`reply_attribution_reason` naming exactly what could not be distinguished. This
-ambiguity is inherent to the LiveKit event surface; it is now disclosed, not
-resolved.
+show a caller answered before they spoke — but it is a *judgement*: LiveKit
+reports a preflight transcript from a second speaker and an ordinary interim
+from the current one through the same event, and preemptive generation is on by
+default, so both really occur. The span now carries `reply_attribution:
+"inferred"` and a `reply_attribution_reason` naming exactly what could not be
+distinguished, and the caveat is attached to the *turn*, so a reply that reports
+LLM tokens and is then interrupted before speaking still carries it.
+
+The events do not distinguish the two cases, but the **speech handle does**:
+preemptive generation is created with `_generate_reply(schedule_speech=False)`
+and stays unscheduled until the prediction is validated, while an ordinary reply
+is marked scheduled synchronously. Both are still unscheduled inside the
+`speech_created` callback itself, so using this signal means deferring the
+binding by an event-loop iteration. That is **open work, not done here** — an
+earlier note in this file calling the ambiguity "inherent" was wrong and is
+withdrawn.
 
 ## 0.4.0
 

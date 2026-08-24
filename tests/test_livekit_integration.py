@@ -4146,6 +4146,91 @@ async def test_a_reply_kept_out_of_a_filler_turn_admits_it_might_belong_there(re
 
 
 @pytest.mark.asyncio
+async def test_a_contested_turns_token_count_carries_the_caveat_with_no_tts_span(recorder):
+    """The tokens are the expensive number, and they can outlive the TTS span.
+
+    A reply can report LLM metrics and then be interrupted before any TTS
+    metric, audio frame or assistant item exists. Carrying the caveat only on
+    the TTS response meant that in exactly that case the turn published an `ok`
+    LLM operation, with prompt and completion tokens on it, and nothing
+    anywhere saying its ownership was a judgement call.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("What is the fare?", True))
+    session.emit("conversation_item_added", chat_item("user", "What is the fare?"))
+    session.emit("speech_created",
+                 speech_created(SimpleNamespace(id="filler-1"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("And to Boston?", False))
+    session.emit("speech_created", speech_created(SimpleNamespace(id="answer-2")))
+    # LLM reports; the reply is then cut off, so no TTS metric ever arrives.
+    session.emit("metrics_collected", llm_metrics("answer-2"))
+    await rec.finish()
+
+    llm = [op for op in operations(read_events(_dir(rec))) if op["type"] == "llm"]
+    assert llm, "the LLM measurement must still be published"
+    assert llm[0]["response"].get("reply_attribution") == "inferred", (
+        "an uncertain turn's tokens must not read as settled just because the "
+        "reply never got as far as speaking"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_swallowed_handler_error_does_not_hedge_the_next_innocent_turn(recorder):
+    """`_guard` keeps the call alive, which must not corrupt later turns.
+
+    The contested marker used to live on the recorder, set in one place and
+    cleared in another. `_guard` deliberately swallows a handler exception and
+    lets recording continue, so a transient failure in between left the marker
+    set, and the next unrelated utterance was published carrying someone else's
+    uncertainty.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("What is the fare?", True))
+    session.emit("conversation_item_added", chat_item("user", "What is the fare?"))
+    session.emit("speech_created",
+                 speech_created(SimpleNamespace(id="filler-1"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("And to Boston?", False))
+
+    original = rec._new_turn
+    calls = {"n": 0}
+
+    def explode():
+        calls["n"] += 1
+        raise RuntimeError("transient bookkeeping failure")
+
+    rec._new_turn = explode
+    # Swallowed by `_guard`, exactly as a real transient failure would be.
+    session.emit("speech_created", speech_created(SimpleNamespace(id="answer-2")))
+    rec._new_turn = original
+    assert calls["n"] == 1, "the test must actually exercise the failure path"
+
+    # A later, entirely unrelated utterance.
+    session.emit("speech_created",
+                 speech_created(SimpleNamespace(id="greeting"), source="say"))
+    session.emit("metrics_collected", tts_metrics("greeting", audio_duration=1.0))
+    rec.tap_output_frame(agent_frame(1000))
+    await rec.finish()
+
+    for op in operations(read_events(_dir(rec))):
+        if op.get("response", {}).get("audio_ms") == 1000:
+            assert "reply_attribution" not in op["response"], (
+                "this turn was never contested; the caveat leaked onto it"
+            )
+
+
+@pytest.mark.asyncio
 async def test_an_uncontested_reply_is_not_labelled_a_guess(recorder):
     """A caveat on every turn is a caveat nobody reads.
 
@@ -4384,6 +4469,39 @@ async def test_the_recorder_never_infers_billing_semantics_from_arrival_time(rec
         "the payload must carry the caveat, not leave it to documentation"
     )
     assert response.get("metered_after_final") is not True
+
+
+@pytest.mark.asyncio
+async def test_a_meter_split_across_the_final_is_reported_as_split(recorder):
+    """A connection meter that ticks either side of the final is the common case.
+
+    Deepgram's five-second collector will routinely have some of its audio
+    before a final transcript and some after. Reporting only `before_final` or
+    only `after_final` would misdescribe it, so the third value has to exist and
+    has to be reachable -- an unreachable enum member is a lie in the schema.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("metrics_collected", stt_metrics(audio_duration=3.0))
+    session.emit("user_input_transcribed", transcript("What is the fare?", True))
+    session.emit("conversation_item_added", chat_item("user", "What is the fare?"))
+    # A second tick lands after the final, so the meter straddles it.
+    session.emit("metrics_collected", stt_metrics(audio_duration=2.0))
+    await rec.finish()
+
+    stt = [op for op in operations(read_events(_dir(rec))) if op["type"] == "stt"]
+    response = stt[0]["response"]
+    total = response.get("provider_metered_audio_ms")
+    after = response.get("metered_after_final_ms")
+    assert total and after and 0 < after < total, (
+        f"this scenario must produce a genuinely split meter, got {after}/{total}"
+    )
+    assert response.get("metered_arrival") == "straddles_final"
+    assert response.get("metering_scope") == "unknown", (
+        "straddling the final says nothing about what is being metered either"
+    )
 
 
 @pytest.mark.asyncio

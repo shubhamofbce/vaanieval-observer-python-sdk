@@ -7,7 +7,10 @@ contract without pulling a heavyweight optional dependency into the suite.
 
 from __future__ import annotations
 
+import asyncio
 import os
+import pathlib
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -4187,8 +4190,39 @@ def public_generate_reply(monkeypatch, tmp_path):
          entry_namespace)
     monkeypatch.setattr(livekit_integration, "_APPLICATION_ENTRY_CODES",
                         (entry_namespace["run"].__code__,))
+    # `AgentActivity._generate_reply()` is the function that actually emits
+    # `speech_created`. LiveKit reaches it directly for the automatic answer to
+    # a completed turn, and the public method reaches it for an application
+    # call -- so it is the anchor the stack always has, even when the public
+    # method has been replaced.
+    emitter_namespace: dict = {}
+    exec(compile("def emit_reply(session, handle_id, make):\n"
+                 "    session.emit('speech_created', make(handle_id))\n",
+                 str((root / "voice" / "agent_activity.py").resolve()), "exec"),
+         emitter_namespace)
+    monkeypatch.setattr(livekit_integration, "_EMITTING_REPLY_CODE",
+                        emitter_namespace["emit_reply"].__code__)
+
+    def reach_emitter(session, handle_id, *, _from):
+        """Call the emitting function from a frame in the given file."""
+        namespace: dict = {}
+        exec(compile("def call(session, handle_id, make, emit):\n"
+                     "    return emit(session, handle_id, make)\n",
+                     str(_from.resolve()), "exec"), namespace)
+        return namespace["call"](
+            session, handle_id,
+            lambda hid: speech_created(FakeSpeechHandle(hid)),
+            emitter_namespace["emit_reply"])
+
+    # A stand-in for the public method is recognised by name *and* receiver,
+    # so the class the receiver must be an instance of has to be known here
+    # too -- the real one is captured when `AgentSession` is resolved.
+    monkeypatch.setattr(livekit_integration, "_AGENT_SESSION_CLASS",
+                        FakeAgentSession)
     framework_caller.package_root = root.parent
     framework_caller.entry_caller = entry_namespace["run"]
+    framework_caller.reach_emitter = reach_emitter
+    framework_caller.livekit_file = root / "voice" / "agent_activity.py"
     return framework_caller
 
 
@@ -5593,4 +5627,371 @@ async def test_the_same_item_delivered_twice_is_only_counted_once(recorder):
     )
     assert (response.get("text") or "") == "One moment One moment", (
         "the agent said it twice, so the transcript says it twice"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_reply_from_a_replaced_public_method_is_not_the_last_callers_answer(
+        recorder, public_generate_reply, tmp_path):
+    """A missing base code object proves absence, not innocence.
+
+    `AgentActivity._generate_reply()` (`agent_activity.py:1506`) is what emits
+    this event, and LiveKit reaches it directly for the automatic answer to a
+    completed turn (`:2574`). A subclass or wrapper that stands in for the
+    public `generate_reply` reaches the same function with an identical event
+    and an identical handle -- only the base code object is gone. Matching on
+    that code object alone therefore read an application's own reply as
+    LiveKit's automatic answer, merged it backwards into the previous caller's
+    turn, and billed them its tokens with no caveat at all.
+    """
+    application = tmp_path / "app" / "tracing_session.py"
+    application.parent.mkdir(parents=True)
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    rec.note_audio_tap_installed()
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("What is the fare?", True))
+    session.emit("conversation_item_added", chat_item("user", "What is the fare?"))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("filler-1"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("And to Boston?", False))
+    public_generate_reply.reach_emitter(session, "wrapped-reply", _from=application)
+    session.emit("metrics_collected", llm_metrics("wrapped-reply"))
+    await rec.finish()
+
+    ops = operations(read_events(_dir(rec)))
+    llm = next(op for op in ops if op["type"] == "llm")
+    question = next(op for op in ops if op["type"] == "stt"
+                    and "What is the fare?" in (op["response"].get("transcript") or ""))
+    assert llm["turn_id"] != question["turn_id"], (
+        "a reply made through a replaced public method was published as the "
+        "certain answer to whoever spoke last"
+    )
+    assert llm["response"].get("reply_attribution") == "inferred", (
+        "the substitution must be disclosed, not resolved silently"
+    )
+    assert "standing in for" in (llm["response"].get("reply_attribution_reason") or ""), (
+        "the caveat must say what it actually found on the stack"
+    )
+
+
+@pytest.mark.asyncio
+async def test_livekits_own_automatic_answer_still_belongs_to_the_turn_it_answers(
+        recorder, public_generate_reply):
+    """The common case must not acquire a caveat to fix the rare one.
+
+    LiveKit reaches the emitting function directly for the automatic answer to
+    a completed turn, and that reply really does answer the caller who just
+    finished speaking. Separating it from a replaced public method has to be
+    done by *who called the emitter*, not by the emitter being reached at all --
+    otherwise every ordinary answer in every call is hedged and the attribution
+    stops meaning anything.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    rec.note_audio_tap_installed()
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("What is the fare?", True))
+    session.emit("conversation_item_added", chat_item("user", "What is the fare?"))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("filler-1"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    # The same contested moment as the test above: an interim arrives over the
+    # filler, so the reply's origin is what decides whose turn it lands in.
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("um", False))
+    public_generate_reply.reach_emitter(
+        session, "auto-reply", _from=public_generate_reply.livekit_file)
+    session.emit("metrics_collected", llm_metrics("auto-reply"))
+    await rec.finish()
+
+    ops = operations(read_events(_dir(rec)))
+    llm = next(op for op in ops if op["type"] == "llm")
+    question = next(op for op in ops if op["type"] == "stt"
+                    and "What is the fare?" in (op["response"].get("transcript") or ""))
+    assert llm["turn_id"] == question["turn_id"], (
+        "LiveKit's own automatic answer was detached from the question it answered"
+    )
+    assert llm["response"].get("reply_attribution") is None, (
+        "an answer whose origin the stack established must not be hedged"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_livekit_build_whose_modules_moved_is_not_read_as_an_automatic_answer(
+        recorder, monkeypatch):
+    """No livekit at all and a livekit that moved are different facts.
+
+    Import failure was one answer: "there is no such public method, so its
+    absence from the stack is a fact about the call". That holds when
+    `livekit.agents` is not in the process at all. It does not hold when the
+    package is right there and only this module moved -- then a real session is
+    generating real replies and the SDK simply cannot read them, which is the
+    one case that must not resolve to "LiveKit's answer to whoever spoke last".
+    """
+    monkeypatch.setattr(livekit_integration, "_GENERATE_REPLY_CODE", None)
+    monkeypatch.setattr(livekit_integration, "_livekit_agents_present",
+                        lambda: True)
+
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    rec.note_audio_tap_installed()
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("What is the fare?", True))
+    session.emit("conversation_item_added", chat_item("user", "What is the fare?"))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("filler-1"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("And to Boston?", False))
+    session.generate_reply(handle_id="moved-reply")
+    session.emit("metrics_collected", llm_metrics("moved-reply"))
+    await rec.finish()
+
+    llm = next(op for op in operations(read_events(_dir(rec)))
+               if op["type"] == "llm")
+    assert llm["response"].get("reply_attribution") == "inferred", (
+        "a build this SDK cannot read reported its replies as certain"
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_framework_caveat_names_a_retry_of_a_run_that_already_exists(
+        recorder, public_generate_reply):
+    """A reissue for an existing run must not be billed to the next caller.
+
+    LiveKit's internal calls were all placed with the speech in flight, which
+    also makes the next final transcript join that turn.
+    `RunResult._maybe_retry_output()` (`run_result.py:292`) and the realtime
+    fallback adapter (`realtime_fallback_adapter.py:394` and `:445`) are not
+    answering anybody speaking: they reissue a reply for a run that already
+    exists. Placing them in flight handed a retry's tokens, latency and cost to
+    whoever spoke next, and put that person's words on the retry's turn -- an
+    exchange neither of them had. The reissue is kept in a turn of its own, and
+    the caveat names the two call sites so an adopter can recognise their case.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    rec.note_audio_tap_installed()
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("What is the fare?", True))
+    session.emit("conversation_item_added", chat_item("user", "What is the fare?"))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("filler-1"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("And to Boston?", False))
+    retry_from = public_generate_reply.package_root / "agents" / "voice" / "run_result.py"
+    public_generate_reply(session, handle_id="retry-reply", _from=retry_from)
+    session.emit("metrics_collected", llm_metrics("retry-reply"))
+    # The person who spoke over the filler now finishes. Their words are their
+    # own; the reissue was never an answer to them.
+    session.emit("user_input_transcribed", transcript("And to Boston?", True))
+    session.emit("conversation_item_added", chat_item("user", "And to Boston?"))
+    await rec.finish()
+
+    ops = operations(read_events(_dir(rec)))
+    llm = next(op for op in ops if op["type"] == "llm")
+    later = next(op for op in ops if op["type"] == "stt"
+                 and "Boston" in (op["response"].get("transcript") or ""))
+    assert llm["turn_id"] != later["turn_id"], (
+        "a reply reissued for an existing run was placed with the speech in "
+        "flight, so the next caller's turn was charged for it and their "
+        "transcript was recorded as the question it answered"
+    )
+    reason = llm["response"].get("reply_attribution_reason") or ""
+    assert "run that already exists" in reason and "run_result.py:292" in reason, (
+        "the caveat does not name the reissue, so an adopter whose reply was "
+        "retried for an existing run cannot tell that it applies to them"
+    )
+
+
+@pytest.mark.asyncio
+async def test_attaching_while_finish_releases_the_call_leaves_nothing_behind(
+        recorder):
+    """The check and the transition it guards have to be under one lock.
+
+    `attach()` read `self.call` before taking the lock, so a thread could see a
+    live call, wait, and register all nine handlers *after* `finish()` had
+    released the call and run an empty `_detach()`. `_guard` makes them inert,
+    so nothing is corrupted -- but nothing removes them either, and a long-lived
+    session keeps the finished recorder and every turn it holds for as long as
+    it lives. Repeating the race accumulates both.
+    """
+    import threading
+
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.note_audio_tap_installed()
+    # Held here so the attaching thread reaches the lock and waits on it. The
+    # lock is reentrant, so `finish()` on this thread still proceeds -- which is
+    # exactly the interleaving being pinned.
+    rec._attach_lock.acquire()
+    try:
+        attaching = threading.Thread(target=rec.attach, args=(session,))
+        attaching.start()
+        time.sleep(0.05)
+        await rec.finish()
+    finally:
+        rec._attach_lock.release()
+    attaching.join(timeout=5)
+
+    assert rec.call is None, "guard: this test is meaningless unless finish ran"
+    assert session.handlers == {}, (
+        "handlers were registered on a live session after the recorder had "
+        "finished, and nothing is left to remove them"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_replys_caveat_does_not_follow_the_turn_it_left_behind(
+        recorder, public_generate_reply):
+    """Reusing an empty turn must not mean inheriting its doubts.
+
+    A framework reply that LiveKit cancels before any metric, audio or tool
+    leaves its turn empty, and the next preemptive reply reuses that turn on
+    purpose so cancelled attempts do not surface as phantoms. But the caveat
+    stored on it described the *cancelled* reply. Left in place, it published a
+    doubt about a reply whose own handle had established where it belongs --
+    the same state leak the per-reply flag exists to prevent, in the other
+    direction.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    rec.note_audio_tap_installed()
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("What is the fare?", True))
+    session.emit("conversation_item_added", chat_item("user", "What is the fare?"))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("filler-1"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("And to Boston?", False))
+    # LiveKit asks for a reply itself, which is placed with the speech in
+    # flight and carries the caveat that its internal callers are not all
+    # answers to it. It is then cancelled before it measures anything at all,
+    # so its turn stays empty -- and stays reusable.
+    public_generate_reply(session, handle_id="framework-reply")
+    # The contested decision is taken one loop slice later.
+    await asyncio.sleep(0)
+    left_behind = rec._preemptive_turn
+    assert left_behind is not None and left_behind.reply_attribution is not None, (
+        "guard: this test is meaningless unless the cancelled reply left a "
+        "caveat on an empty turn for the next one to inherit"
+    )
+    # The ordinary preemptive reply that follows reuses that empty turn. Its
+    # own handle says where it belongs, so it has nothing to be hedged about.
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("known-reply", scheduled=False)))
+    assert rec._preemptive_turn is left_behind, (
+        "guard: this test is meaningless unless the empty turn was reused"
+    )
+    session.emit("metrics_collected", llm_metrics("known-reply"))
+    session.emit("user_input_transcribed", transcript("And to Boston?", True))
+    session.emit("conversation_item_added", chat_item("user", "And to Boston?"))
+    await rec.finish()
+
+    llm = next(op for op in operations(read_events(_dir(rec)))
+               if op["type"] == "llm")
+    assert llm["response"].get("reply_attribution") is None, (
+        "a reply whose own handle established its origin carried a cancelled "
+        "reply's caveat"
+    )
+    assert llm["response"].get("reply_attribution_reason") is None, (
+        "the cancelled reply's reason outlived the reply it described"
+    )
+
+
+def test_a_warning_is_not_prefixed_with_the_package_name_twice():
+    """`_warn_once` adds the prefix, so a message must not carry its own.
+
+    Nine call sites passed a message that already began with `vaani: ` into the
+    helper that prepends it, and every one of those warnings reached adopters
+    reading `vaani: vaani: ...`. It is cosmetic, but it is the first thing an
+    adopter sees when something has gone wrong with their recording, and it
+    reads as though the product cannot keep track of its own output.
+    """
+    import ast
+
+    source = pathlib.Path(livekit_integration.__file__).read_text()
+    doubled = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        name = getattr(node.func, "attr", None)
+        if name != "_warn_once":
+            continue
+        for argument in node.args:
+            value = getattr(argument, "value", None)
+            if isinstance(value, str) and value.startswith("vaani: "):
+                doubled.append((node.lineno, value[:60]))
+    assert doubled == [], (
+        f"messages carry the prefix the helper already adds: {doubled}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_override_that_reaches_past_the_emitter_is_not_the_last_answer(
+        recorder, public_generate_reply):
+    """The last silent merge: no base method, no emitting frame, no anchor.
+
+    A tracing or custom `AgentSession` subclass can override the public method
+    and reach a *different* protected API, so neither the base code object nor
+    `AgentActivity._generate_reply()` is on the stack. That is indistinguishable
+    from LiveKit's automatic answer by every other means, and reading it as one
+    merged the application's reply backwards into the previous caller's turn
+    with nothing recorded about it -- the one direction a failure to identify
+    must never take.
+
+    A frame calling itself `generate_reply` on an `AgentSession` is weaker
+    evidence than either anchor, which is why it is consulted last. It is still
+    enough to know the reply was not the automatic one.
+    """
+    rec = recorder()
+
+    class OverriddenSession(FakeAgentSession):
+        def generate_reply(self, **kwargs):  # noqa: D401 - stands in
+            handle_id = kwargs.pop("handle_id", "override-reply")
+            self.emit("speech_created",
+                      speech_created(FakeSpeechHandle(handle_id)))
+
+    session = OverriddenSession()
+    rec.attach(session)
+    rec.note_audio_tap_installed()
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("What is the fare?", True))
+    session.emit("conversation_item_added", chat_item("user", "What is the fare?"))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("filler-1"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("And to Boston?", False))
+    session.generate_reply(handle_id="override-reply")
+    session.emit("metrics_collected", llm_metrics("override-reply"))
+    await rec.finish()
+
+    ops = operations(read_events(_dir(rec)))
+    llm = next(op for op in ops if op["type"] == "llm")
+    asked = next(op for op in ops if op["type"] == "stt"
+                 and "fare" in (op["response"].get("transcript") or ""))
+    assert llm["turn_id"] != asked["turn_id"], (
+        "a reply from a replaced public method was merged into the previous "
+        "caller's turn, so their exchange reports tokens they never prompted"
+    )
+    assert llm["response"].get("reply_attribution") == "inferred", (
+        "the reply was separated on a guess, and a reader deciding a latency "
+        "from it is owed that"
     )

@@ -4,6 +4,59 @@ Every recorded package stamps its SDK version into the manifest, so the version
 here is what a bug report is tied back to. Entries describe what changed about
 *the data* — a fix that alters no recorded value is not worth an adopter's time.
 
+## 0.5.4
+
+A twelfth review pass, aimed at the anchor the eleventh release rests on. It
+found that the anchor itself can be removed from the stack, that one family of
+LiveKit's own calls is billed to the wrong caller, and that a cancelled reply
+can hand its caveat to an unrelated one. Two of the five findings are about the
+dashboard rather than the SDK.
+
+**A replaced `generate_reply()` looked exactly like LiveKit's automatic answer.**
+The call site was matched against the public method's code object, which a
+subclass, a wrapper or any tracing layer can replace — and a reply that never
+passed through it was read as the automatic answer to the previous caller and
+merged backwards into their turn, silently. Replies are now anchored on
+`AgentActivity._generate_reply()`, the function that actually emits the event
+and is therefore always on the stack, and the decision is taken from *who
+called it*: LiveKit itself (`agent_activity.py:2574`) is the automatic answer,
+anything else is a stand-in for the public method. Where even that is absent, a
+frame calling itself `generate_reply` on an `AgentSession` is enough to know the
+reply was not the automatic one. Verified against real `AgentActivity` objects
+on livekit-agents 1.7.0.
+
+**A reissued reply was charged to whoever spoke next.**
+`RunResult._maybe_retry_output()` (`run_result.py:292`) and the realtime
+fallback adapter (`llm/realtime_fallback_adapter.py:394` and `:445`) reissue a
+reply for a run that *already exists*. They were placed with the speech in
+flight like LiveKit's other internal calls, so the next caller's turn was
+charged for the retry's tokens, latency and cost, and that caller's transcript
+was recorded as the question it answered — an exchange neither of them had.
+Reissues are now kept in a turn of their own and are not joined by the
+following transcript.
+
+**A cancelled reply left its caveat behind for the next one.**
+When LiveKit's own reply was cancelled before it measured anything, its empty
+turn was reused by the next reply — which inherited a `reply_attribution` that
+described a call it was not. A reply whose own handle says where it belongs now
+clears the caveat when it takes over an abandoned turn.
+
+**`attach()` could register handlers onto a finished recorder.**
+The check for a live call was read *outside* the lock that guards the
+transition, so a thread could see a live call, wait, and subscribe all nine
+handlers after `finish()` had already detached. They are inert, but nothing
+removes them, so a long-lived session held the finished recorder and every turn
+in it. The check and the transition are now under the same lock on both sides.
+
+**Two dashboard fixes.** The `operations(turns)` index was created *after* the
+migration that scans on it, so a backfill on a large archive ran unindexed
+(measured 3.9× for 2× input). And the continuation rebuild materialised every
+turn in the archive at once (36.9 MiB traced for 150k turns); it now resolves
+one call at a time — 0.27 s and 0.1 MiB peak for the same input.
+
+**Warnings no longer read `vaani: vaani:`.** Nine call sites passed a message
+that already carried the prefix into a helper that adds it.
+
 ## 0.5.3
 
 An eleventh review pass, aimed at the reply-attribution work itself. It found

@@ -14,3 +14,8 @@ venv/
 # Never commit provider keys.
 .env
 .env.*
+
+# Build output. The wheel adopters install is attached to a release, not committed.
+build/
+dist/
+*.egg-info/

@@ -1505,7 +1505,13 @@ class VaaniLiveKitRecorder:
             # only happen after a preemptive reply was merged below, and a
             # second, unrelated speech must not quietly join it.
             state = None
-        if state is None and self._pending_stt.started_at_ms is not None:
+        if (state is None
+                and source == "generate_reply"
+                and self._pending_stt.started_at_ms is not None):
+            # Only a generated reply can be preemptive. `say()` reports
+            # `source="say"` (agent_activity.py:1442) and is spoken *at* the
+            # caller, not in answer to them -- a filler said while the caller is
+            # still talking would otherwise swallow their transcript.
             # LiveKit generates a reply from a *predicted* end of turn while the
             # user is still speaking (`preemptive_generation` is on by default),
             # so this speech arrives before the final transcript it answers.

@@ -3291,3 +3291,34 @@ async def test_a_reply_that_never_made_a_sound_is_not_reported_as_missing_audio(
         "a reply that made no sound has no unattributed audio to report")
     assert not [g for g in gaps if "audio was rendered that no tts" in g["reason"]], (
         "no audio was rendered, so that gap must not fire")
+
+
+async def test_a_filler_said_while_the_caller_talks_does_not_swallow_their_turn(recorder):
+    """`say()` reports `source="say"` and is spoken *at* the caller -- a
+    "let me look that up" filler while they are still talking answers nothing.
+    Only a generated reply can be preemptive, so the filler must keep its own
+    turn and leave the caller's utterance to the reply that answers it."""
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("goa ki", False))
+    # a filler, spoken over the caller
+    session.emit("speech_created", speech_created(SimpleNamespace(id="speech-say"), source="say"))
+    rec.tap_output_frame(agent_frame(300))
+    session.emit("metrics_collected", tts_metrics("speech-say"))
+    session.emit("metrics_collected", stt_metrics())
+    session.emit("user_state_changed", SimpleNamespace(new_state="listening"))
+    session.emit("user_input_transcribed", transcript("goa ki flight kitne ki hai", True))
+    session.emit("speech_created", speech_created(SimpleNamespace(id="speech-1")))
+    session.emit("metrics_collected", llm_metrics("speech-1"))
+    rec.tap_output_frame(agent_frame(800))
+    session.emit("metrics_collected", tts_metrics("speech-1"))
+    await rec.finish()
+
+    states = rec._all_turns
+    assert len(states) == 2, "the filler must not merge with the caller's turn"
+    assert states[0].stt is None, "a filler answers nothing"
+    assert not states[0].llm, "`say()` runs no LLM"
+    assert states[1].stt is not None and states[1].llm, (
+        "the caller's words belong to the reply that answered them")

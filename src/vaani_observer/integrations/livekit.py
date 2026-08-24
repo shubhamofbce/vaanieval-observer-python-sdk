@@ -367,7 +367,7 @@ class _TurnState:
         self.user_committed = False
 
 
-def _is_unanswered_turn(state: "_TurnState") -> bool:
+def _is_unanswered_turn(state: "_TurnState", allow_filler: bool = True) -> bool:
     """True when a turn has the caller's words but nothing said back yet.
 
     A `say()` is speech, not an answer. Counting a filler as one made the turn
@@ -376,7 +376,14 @@ def _is_unanswered_turn(state: "_TurnState") -> bool:
     question in it. The caller's turn then read as unanswered while the answer
     read as unprompted, which is the same exchange described wrongly twice.
     """
-    filler_only = state.reply_source == "say" and not state.llm and not state.tools
+    # `allow_filler` is the caller's answer to "is this turn still the live
+    # exchange?". A filler-only turn stays adoptable for the answer that follows
+    # it -- but it must stop being adoptable the moment the *next* caller starts
+    # talking, or their preemptively generated reply is adopted backwards into
+    # the previous caller's turn and the two exchanges are recorded as one.
+    # marker:r12-filler-not-across-callers
+    filler_only = (allow_filler and state.reply_source == "say"
+                   and not state.llm and not state.tools)
     return (
         not state.llm
         and (state.tts is None or filler_only)
@@ -542,6 +549,7 @@ class VaaniLiveKitRecorder:
         # ever possible" -- so on its own it would let the first agent's tap
         # certify the silence that follows.
         self._agent_tap_lost = False
+        self._agent_tap_missing = False
         # The turn whose STT span most recently stopped collecting. A recogniser
         # that meters *after* the final needs somewhere to put the usage that is
         # not the next caller's turn.
@@ -885,7 +893,8 @@ class VaaniLiveKitRecorder:
         # capture tells an operator their numbers are trustworthy at the one
         # moment they are least able to be. A correctly wired agent that simply
         # never spoke stays distinguishable, because its tap *was* installed.
-        if self._agent_tap_lost:
+        if self._agent_tap_lost or (self._agent_tap_missing
+                                    and self._agent_audio_tapped):
             # Known loss. The manifest previously said `coverage_complete` here
             # while the process log said the opposite, which is the worst of
             # both: the operator is told the numbers are whole by the same
@@ -899,8 +908,8 @@ class VaaniLiveKitRecorder:
             try:
                 report(
                     "tts",
-                    "the call was handed off to an untapped agent, so agent audio "
-                    "after the handoff was never captured",
+                    "an agent in this call was not tapped, so the audio it spoke "
+                    "was never captured",
                     agent_audio_tapped=True,
                     agent_tap_lost_on_handoff=True,
                 )
@@ -1420,6 +1429,13 @@ class VaaniLiveKitRecorder:
             # earlier agent's tap must not be allowed to certify the call.
             if self._agent_audio_tapped:
                 self._agent_tap_lost = True
+            # Recorded whichever way round the handoff went. Only remembering
+            # tapped->untapped meant a call that *started* untapped and was
+            # handed to a tapped agent ended with `agent_audio_tapped: True`,
+            # which suppressed the never-tapped gap, and `agent_tap_lost: False`
+            # -- so a call missing its whole first agent certified as complete.
+            # marker:r12-tap-missing-either-order
+            self._agent_tap_missing = True
             return
         self._agent_audio_tapped = True
 
@@ -1684,6 +1700,16 @@ class VaaniLiveKitRecorder:
         # says so: as `audio_ms` it read as speech duration and a real merged
         # turn showed 5000ms of "audio" on a 2975ms span.
         response["provider_metered_audio_ms"] = pending.metrics.get("audio_ms")
+        # The recogniser's token counts are as much a billing fact as its
+        # metered audio. Publishing only the audio dropped every token a
+        # provider reported *before* the final -- the ordinary case for anything
+        # that meters mid-utterance -- so a turn showed metered seconds and no
+        # tokens, and the two numbers could never be reconciled.
+        # marker:r12-tokens-before-final
+        for _key in ("input_tokens", "output_tokens"):
+            _value = pending.metrics.get(_key)
+            if _value is not None:
+                response[_key] = (response.get(_key) or 0) + _value
         if continues is not None:
             response["continues_turn"] = continues
             response["split_reason"] = "earlier_words_already_published"
@@ -1727,6 +1753,12 @@ class VaaniLiveKitRecorder:
             response["provider_metered_audio_ms"] = (
                 (response.get("provider_metered_audio_ms") or 0) + metered
             )
+        # Summed for the same reason as the audio: each segment of a merged
+        # turn was charged separately. marker:r12-tokens-before-final
+        for _key in ("input_tokens", "output_tokens"):
+            _value = pending.metrics.get(_key)
+            if _value is not None:
+                response[_key] = (response.get(_key) or 0) + _value
         response["final_segments"] = int(response.get("final_segments") or 1) + 1
         state.stt_ended_at = at
         self._pending_stt = _PendingStt()
@@ -1793,7 +1825,9 @@ class VaaniLiveKitRecorder:
             if (carry is not None
                     and source == "generate_reply"
                     and carry.stt is not None
-                    and _is_unanswered_turn(carry)):
+                    and _is_unanswered_turn(
+                        carry,
+                        allow_filler=self._pending_stt.started_at_ms is None)):
                 state = carry
         if (state is None
                 and source == "generate_reply"
@@ -1833,12 +1867,23 @@ class VaaniLiveKitRecorder:
         # one span -- but the total stops being a single opaque number that
         # reads as the answer's own duration.
         # marker:r12-filler-before-answer
-        if (source == "generate_reply" and state.reply_source == "say"
-                and state.tts is not None and not state.tts.ended):
-            spoken = state.tts_response.get("audio_ms")
+        # Gating this on the filler's metrics having already arrived was a race
+        # we lost routinely: `say()` emits `speech_created` synchronously and
+        # only then schedules its TTS task (agent_activity.py:1435), so a
+        # generated reply can be created first. The filler's audio then folded
+        # into the answer with nothing saying it had -- the exact silent
+        # inflation this marker exists to prevent. The fact that a filler ran is
+        # recorded either way; only its duration waits on the meter.
+        if source == "generate_reply" and state.reply_source == "say":
+            spoken = (state.tts_response.get("audio_ms")
+                      if state.tts is not None and not state.tts.ended else None)
             state.tts_response["reply_includes_filler"] = True
             if spoken:
                 state.tts_response["filler_audio_ms"] = spoken
+            else:
+                # Better an admitted unknown than a number that reads as the
+                # answer's own duration.
+                state.tts_response["filler_audio_ms_unknown"] = True
             state.tts_response["filler_audio_bytes"] = state.audio_bytes
         self._turns[speech_id] = state
         state.speech_handle = getattr(event, "speech_handle", None)
@@ -2394,6 +2439,18 @@ class VaaniLiveKitRecorder:
                 response[key] = (response.get(key) or 0) + value
             # The turn it landed on is not the turn it was measured against.
             response["metered_after_final"] = True
+            # How much of the published meter arrived after the caller stopped
+            # talking. A connection-metering recogniser -- Deepgram flushes
+            # every five seconds off frames streamed, silence included
+            # (plugins/deepgram/stt.py:484) -- puts inter-turn silence here,
+            # while an utterance-metering one (OpenAI, plugins/openai/stt.py:895)
+            # puts real speech here. Nothing in the payload distinguishes them,
+            # so rather than guess we publish the subtractable amount and let
+            # the consumer decide. marker:r12-metered-after-final-ms
+            if metered is not None:
+                response["metered_after_final_ms"] = (
+                    (response.get("metered_after_final_ms") or 0) + metered
+                )
             return
         carried = (pending.metrics or {}).get("audio_ms")
         merged: Dict[str, Any] = {
@@ -2501,9 +2558,24 @@ class VaaniLiveKitRecorder:
             # on, because "we saw 179 characters go by" is a fact worth keeping
             # even under a policy that forbids storing them.
             if text:
+                # Two utterances share this span when a filler preceded the
+                # answer, and each commits its own assistant item. Assigning
+                # meant the answer overwrote the filler's words, so a span that
+                # honestly reported both durations reported only half the
+                # speech -- and `char_count`, which is kept even when content
+                # capture is off, understated by the same amount.
+                # marker:r12-filler-words-kept
+                merge = bool(state.tts_response.get("reply_includes_filler"))
                 if self._capture_transcripts:
-                    state.tts_response["text"] = text
-                state.tts_response["char_count"] = len(text)
+                    prior = state.tts_response.get("text")
+                    state.tts_response["text"] = (
+                        f"{prior} {text}" if merge and prior and text not in prior
+                        else text
+                    )
+                state.tts_response["char_count"] = (
+                    (state.tts_response.get("char_count") or 0) + len(text)
+                    if merge else len(text)
+                )
             # LiveKit knows whether the reply was cut off; the TTS plugin's own
             # `cancelled` flag does not survive every interruption path.
             if getattr(item, "interrupted", None):

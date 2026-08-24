@@ -634,8 +634,9 @@ class VaaniLiveKitRecorder:
         # is the call itself. Counted rather than flagged because a tool may
         # call it while another call is in progress.
         self._application_reply_depth = 0
-        # (session, attribute, original) for methods wrapped to observe that,
-        # so attaching twice or detaching leaves the session as it was found.
+        # (session, attribute, original, had_own) for methods wrapped to observe
+        # the call, so detaching leaves the session as it was found -- including
+        # whether the attribute was the session's own or the class's.
         self._patched: List[tuple] = []
         self._sockets: List[Any] = []
         # (session, event name, wrapped handler). The *wrapped* reference has to
@@ -843,17 +844,28 @@ class VaaniLiveKitRecorder:
         with the arguments it was given and its result returned untouched.
         """
         original = getattr(session, "generate_reply", None)
-        if not callable(original) or getattr(original, "_vaani_wrapped", False):
+        if not callable(original):
+            return
+        if getattr(original, "_vaani_watcher", None) is self:
+            # Attaching twice must not stack this recorder's own wrapper. A
+            # *different* recorder's wrapper is chained rather than skipped:
+            # skipping it left the second recorder counting nothing, and a
+            # recorder that cannot see the call reports an application's own
+            # reply as the automatic answer -- silently, which is the failure
+            # this whole mechanism exists to end.
             return
 
         def wrapper(*args: Any, **kwargs: Any) -> Any:
             self._application_reply_depth += 1
             try:
-                return original(*args, **kwargs)
+                # Through the attribute, not the closure, so a recorder further
+                # down the chain can splice itself out on detach.
+                return wrapper._vaani_next(*args, **kwargs)  # type: ignore[attr-defined]
             finally:
                 self._application_reply_depth -= 1
 
-        wrapper._vaani_wrapped = True  # type: ignore[attr-defined]
+        wrapper._vaani_watcher = self  # type: ignore[attr-defined]
+        wrapper._vaani_next = original  # type: ignore[attr-defined]
         try:
             had_own = "generate_reply" in vars(session)
             session.generate_reply = wrapper
@@ -866,7 +878,26 @@ class VaaniLiveKitRecorder:
                 "filler will be reported as inferred", error,
             )
             return
-        self._patched.append((session, "generate_reply", original if had_own else None))
+        self._patched.append((session, "generate_reply", original, had_own))
+
+    def _unlink_wrapper(self, outermost: Any) -> None:
+        """Splice this recorder's wrapper out of a chain someone else tops.
+
+        Walking by attribute rather than by closure is the whole reason the
+        wrapper delegates through `_vaani_next`: the recorder above ours holds
+        no reference we could rewrite otherwise, so detaching would either
+        disable it or leave a finished recorder counting for the life of the
+        session.
+        """
+        seen = set()
+        node = outermost
+        while node is not None and id(node) not in seen:
+            seen.add(id(node))
+            following = getattr(node, "_vaani_next", None)
+            if getattr(following, "_vaani_watcher", None) is self:
+                node._vaani_next = getattr(following, "_vaani_next", following)
+                return
+            node = following
 
     def _sniff_models(self, session: Any) -> None:
         """Learn each stage's real model from the plugin instance.
@@ -914,12 +945,26 @@ class VaaniLiveKitRecorder:
             except Exception as error:  # noqa: BLE001 - teardown must not raise
                 logger.debug("vaani: cannot unsubscribe from %r (%s)", name, error)
         self._attached.clear()
-        for session, attribute, original in self._patched:
+        for session, attribute, original, had_own in self._patched:
             try:
-                if original is None:
+                current = getattr(session, attribute, None)
+                if getattr(current, "_vaani_watcher", None) is not self:
+                    # Someone wrapped on top of ours. Putting the original back
+                    # would tear their wrapper off with it, so unlink ours from
+                    # inside the chain instead and leave theirs working. A
+                    # session outliving this recorder must not keep calling into
+                    # it, and must not lose another recorder either.
+                    self._unlink_wrapper(current)
+                    continue
+                # What our wrapper delegates to *now*, which is not always what
+                # it was given: a recorder underneath ours may have spliced
+                # itself out since. Restoring the captured value would put its
+                # detached wrapper back.
+                following = getattr(current, "_vaani_next", original)
+                if not had_own and following is original:
                     delattr(session, attribute)
                 else:
-                    setattr(session, attribute, original)
+                    setattr(session, attribute, following)
             except Exception as error:  # noqa: BLE001 - teardown must not raise
                 logger.debug("vaani: cannot restore %r (%s)", attribute, error)
         self._patched.clear()

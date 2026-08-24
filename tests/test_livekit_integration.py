@@ -4362,6 +4362,57 @@ async def test_a_realtime_models_own_reply_is_not_merged_into_the_previous_calle
     )
 
 
+@pytest.mark.asyncio
+async def test_a_second_recorder_on_one_session_still_sees_the_call(recorder):
+    """Two recorders must not blind each other to who asked for a reply.
+
+    Observing `generate_reply` means replacing it, and a recorder that skipped
+    an already-replaced method counted nothing -- so its packages reported an
+    application's own reply as the automatic answer to the previous caller,
+    silently, which is the failure the observation exists to prevent. Wrappers
+    chain instead, and tearing one down leaves a wrapper someone else put on
+    top in place.
+    """
+    first = recorder()
+    second = recorder()
+    session = FakeAgentSession()
+    first.attach(session)
+    second.attach(session)
+    for rec in (first, second):
+        rec.note_audio_tap_installed()
+        session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("question one", True))
+    session.emit("conversation_item_added", chat_item("user", "question one"))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("filler"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler", audio_duration=0.4))
+    session.emit("user_input_transcribed", transcript("um", False))
+    session.generate_reply(input_modality="audio", handle_id="own-reply")
+    session.emit("metrics_collected", llm_metrics("own-reply"))
+    await first.finish()
+    await second.finish()
+
+    for name, rec in (("first", first), ("second", second)):
+        ops = operations(read_events(_dir(rec)))
+        llm = next(op for op in ops if op["type"] == "llm")
+        assert llm["response"].get("reply_attribution") == "inferred", (
+            f"the {name} recorder could not see the call and reported an "
+            "application's own reply as the answer to the previous caller"
+        )
+
+    # And the session is handed back as it was found. A leftover wrapper keeps
+    # a finished recorder on the call path for the life of the session, which is
+    # a leak with a counter in it.
+    assert getattr(session.generate_reply, "_vaani_watcher", None) is None, (
+        "a wrapper outlived both recorders, keeping a finished recorder on the "
+        "call path for the life of the session"
+    )
+    assert session.generate_reply.__func__ is FakeAgentSession.generate_reply, (
+        "the session was not handed back the method it came with"
+    )
+    session.generate_reply(input_modality="audio", handle_id="after-detach")
+
+
 def tools_executed(name: str = "search_flights") -> Any:
     call = SimpleNamespace(name=name, arguments='{"to":"GOI"}', call_id="c1")
     output = SimpleNamespace(output='{"price":6000}', is_error=False, call_id="c1")

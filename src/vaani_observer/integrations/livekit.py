@@ -271,6 +271,7 @@ class _TurnState:
                  "seq", "finished_at_seq",
                  "tts_was_derived",
                  "awaiting_reply_item",
+                 "user_committed",
                  "published_played_ms")
 
     def __init__(self, turn_id: str, turn: Any) -> None:
@@ -358,6 +359,22 @@ class _TurnState:
         # Retired from rendering, but its span is held open until LiveKit
         # commits the reply's text so the transcript is not lost.
         self.awaiting_reply_item = False
+        # True once LiveKit has committed this turn's user message. LiveKit
+        # merges every final transcript it receives before the commit into one
+        # user message, so an uncommitted turn is still collecting the caller's
+        # words and a later final belongs to it rather than to a new turn.
+        self.user_committed = False
+
+
+def _is_unanswered_turn(state: "_TurnState") -> bool:
+    """True when a turn has the caller's words but nothing said back yet."""
+    return (
+        not state.llm
+        and state.tts is None
+        and state.audio_bytes == 0
+        and not state.tools
+        and not state.open_streams
+    )
 
 
 def _is_empty_turn(state: "_TurnState") -> bool:
@@ -442,6 +459,12 @@ class VaaniLiveKitRecorder:
         self._turns: Dict[str, _TurnState] = {}
         self._all_turns: List[_TurnState] = []
         self._pending_turn: Optional[_TurnState] = None
+        # The turn still collecting the caller's words. Distinct from
+        # `_pending_turn`, which `speech_created` consumes: LiveKit creates a
+        # reply speech for every final transcript and cancels the superseded
+        # ones, so the pending slot is empty again long before the caller's
+        # message is committed.
+        self._collecting_turn: Optional[_TurnState] = None
         # A reply LiveKit generated before the transcript it answers went final,
         # kept with the utterance it was generated from so it cannot be handed
         # a later one.
@@ -726,6 +749,7 @@ class VaaniLiveKitRecorder:
         # it as unattributed, which is what it is. marker:r9-release-on-finish
         self._unpinned_streams.clear()
         self._preemptive_turn = None
+        self._collecting_turn = None
         try:
             self.finalize_open_spans(call, outcome=outcome)
             finalized = await call.end(outcome=outcome)
@@ -1423,6 +1447,22 @@ class VaaniLiveKitRecorder:
         """A final transcript ends the user's half of the turn and opens ours."""
         pending = self._pending_stt
         pending.metrics = {**self._stt_identity, **pending.metrics}
+        # LiveKit's turn boundary is the *commit*, not the final transcript.
+        # A provider can deliver one utterance as several finals ("Thanks." /
+        # "That is all I needed." / "Goodbye."), and LiveKit merges them into a
+        # single user message answered by a single reply. Opening a turn per
+        # final recorded the same exchange as three: two showing the caller
+        # talking to an agent that never answered, and per-turn latency
+        # averages diluted by turns that never had a reply to measure.
+        # marker:r11-merge-finals
+        carry = self._collecting_turn
+        if (carry is not None
+                and not carry.user_committed
+                and carry.stt is not None
+                and self._preemptive_turn is None
+                and _is_unanswered_turn(carry)):
+            self._extend_user_turn(carry, text, at, pending, reason)
+            return
         # A preemptive reply is only ever generated from the utterance that is
         # still open, and clearing it here is what keeps it from claiming the
         # next one: it is set while `_pending_stt` is live and consumed the
@@ -1431,6 +1471,7 @@ class VaaniLiveKitRecorder:
         self._preemptive_turn = None
         self._pending_stt = _PendingStt()
         self._pending_turn = state
+        self._collecting_turn = state
         self._current_turn = state
         started_at_ms = pending.started_at_ms if pending.started_at_ms is not None else at
         operation = state.turn.start_operation(
@@ -1477,6 +1518,42 @@ class VaaniLiveKitRecorder:
         state.stt_response = response
         state.stt_ended_at = at
 
+    def _extend_user_turn(self, state: "_TurnState", text: str, at: int,
+                          pending: "_PendingStt", reason: str) -> None:
+        """Fold another final transcript into the turn already collecting it.
+
+        The STT span is deliberately still open here -- it is held until the
+        turn closes so LiveKit's own per-turn report can be folded in -- so the
+        extra segment extends that one span instead of starting a rival one.
+        """
+        operation = state.stt
+        if pending.first_partial_at_ms is not None:
+            operation.event("first_partial", occurred_at_ms=pending.first_partial_at_ms)
+        if pending.ended_at_ms is not None:
+            operation.event("speech_ended", occurred_at_ms=pending.ended_at_ms)
+        operation.event("final_transcript", occurred_at_ms=at, final_reason=reason)
+        operation.event("speech_final", occurred_at_ms=at)
+        if self._capture_transcripts:
+            for sample in pending.partials:
+                operation.sample("partial", sample, limit=_PARTIAL_SAMPLE_LIMIT)
+            if pending.truncated:
+                operation.event("partial_samples_truncated", limit=_PARTIAL_SAMPLE_LIMIT)
+        response = state.stt_response
+        if self._capture_transcripts:
+            previous = (response.get("transcript") or "").strip()
+            response["transcript"] = f"{previous} {text}".strip()
+        else:
+            response["char_count"] = (response.get("char_count") or 0) + len(text)
+        response["final_reason"] = reason
+        # Both denominators are summed rather than replaced: the caller spoke
+        # for the total of the segments, not for the last one.
+        audio_ms = pending.metrics.get("audio_ms")
+        if audio_ms is not None:
+            response["audio_ms"] = (response.get("audio_ms") or 0) + audio_ms
+        response["final_segments"] = int(response.get("final_segments") or 1) + 1
+        state.stt_ended_at = at
+        self._pending_stt = _PendingStt()
+
     def _on_speech_created(self, event: Any) -> None:
         """Bind a LiveKit speech handle to the turn it is replying to."""
         speech_id = _speech_id(getattr(event, "speech_handle", None))
@@ -1505,6 +1582,20 @@ class VaaniLiveKitRecorder:
             # only happen after a preemptive reply was merged below, and a
             # second, unrelated speech must not quietly join it.
             state = None
+        if state is None:
+            # LiveKit answers a *provisional* end of turn: it creates a reply
+            # for each final transcript and cancels the ones the caller talked
+            # past. A superseding attempt answers the same uncommitted message,
+            # so it belongs to the turn already collecting it -- otherwise the
+            # reply lands in a turn of its own and the caller's words sit in
+            # one that looks unanswered.
+            # marker:r11-supersede
+            carry = self._collecting_turn
+            if (carry is not None
+                    and not carry.user_committed
+                    and carry.stt is not None
+                    and _is_unanswered_turn(carry)):
+                state = carry
         if (state is None
                 and source == "generate_reply"
                 and self._pending_stt.started_at_ms is not None):
@@ -2095,6 +2186,15 @@ class VaaniLiveKitRecorder:
         metrics = getattr(item, "metrics", None) or {}
         text = (getattr(item, "text_content", None) or "").strip()
         if role == "user":
+            # LiveKit has committed the caller's message: whatever it says next
+            # opens a new turn rather than extending this one.
+            # Marking the turn is what closes collection; the reference is
+            # released with it. A superseding speech always adopts the turn
+            # still collecting, so the current turn *is* that turn here --
+            # marking the collecting turn separately was unreachable and is
+            # deliberately not carried as a branch nothing can execute.
+            state.user_committed = True
+            self._collecting_turn = None
             if state.stt is not None and not state.stt.ended:
                 state.stt.event(
                     "turn_report",

@@ -1874,6 +1874,10 @@ async def test_stt_identity_survives_a_turn_whose_metric_arrived_earlier(recorde
     rec.attach(session)
     session.emit("metrics_collected", stt_metrics())
     session.emit("user_input_transcribed", transcript("first", True))
+    # LiveKit commits the first utterance before the second one starts, which
+    # is what makes these two turns rather than one utterance delivered as two
+    # finals. Without the commit they would -- correctly -- share a span.
+    session.emit("conversation_item_added", chat_item("user", "first"))
     # No second stt_metrics event for the next utterance.
     session.emit("user_input_transcribed", transcript("second", True))
     await rec.finish()
@@ -2498,17 +2502,20 @@ async def test_a_greeting_never_blocks_the_next_replys_own_llm_metric(recorder):
 
 
 async def test_a_superseded_user_turn_never_becomes_a_phantom_claimant(recorder):
-    """Two final transcripts before any reply -- an endpoint that fires twice,
-    which LiveKit answers with a single reply -- replaced `_pending_turn`
-    while the first state stayed live in `_all_turns` forever. It can never be
-    retired, because retirement runs off the *speaking* turn and this one
-    never spoke. From then on every unnamed LLM or TTS metric saw two live
-    turns and was refused for the rest of the call: one dropped endpoint
-    silently stopped the call from measuring anything again."""
+    """A committed utterance that LiveKit never answered -- it can decline to
+    reply -- left `_pending_turn` replaced while the first state stayed live in
+    `_all_turns` forever. It can never be retired, because retirement runs off
+    the *speaking* turn and this one never spoke. From then on every unnamed
+    LLM or TTS metric saw two live turns and was refused for the rest of the
+    call: one unanswered utterance silently stopped the call from measuring
+    anything again."""
     rec = recorder()
     session = FakeAgentSession()
     rec.attach(session)
     session.emit("user_input_transcribed", transcript("goa ki", True))
+    # The commit is what makes these two turns. Without it LiveKit would merge
+    # them into one user message, and the recorder follows that boundary.
+    session.emit("conversation_item_added", chat_item("user", "goa ki"))
     session.emit("user_input_transcribed", transcript("flight kitne ki hai", True))
     reply = FakeSpeechHandle("s1")
     session.emit("speech_created", speech_created(reply))
@@ -3322,3 +3329,118 @@ async def test_a_filler_said_while_the_caller_talks_does_not_swallow_their_turn(
     assert not states[0].llm, "`say()` runs no LLM"
     assert states[1].stt is not None and states[1].llm, (
         "the caller's words belong to the reply that answered them")
+
+
+# ------------------------------------------------- one utterance, many finals
+
+
+async def test_one_utterance_delivered_as_several_finals_is_a_single_turn(recorder):
+    """LiveKit's boundary is the commit, so pre-commit finals share a turn.
+
+    A provider is free to end a transcript at every sentence. LiveKit merges
+    those into one user message and answers it once; recording a turn per
+    final invented two turns whose caller was never answered.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("Thanks.", True))
+    session.emit("user_input_transcribed", transcript("That is all I needed.", True))
+    session.emit("user_input_transcribed", transcript("Goodbye.", True))
+    session.emit("conversation_item_added",
+                 chat_item("user", "Thanks. That is all I needed. Goodbye."))
+    session.emit("speech_created", speech_created(SimpleNamespace(id="speech-1")))
+    session.emit("metrics_collected", llm_metrics("speech-1"))
+    rec.tap_output_frame(agent_frame(2000))
+    session.emit("metrics_collected", tts_metrics("speech-1"))
+    await rec.finish()
+    stt_ops = [e for e in operations(read_events(_dir(rec))) if e["type"] == "stt"]
+    assert len(stt_ops) == 1
+    stt = _by_type(rec, "stt")
+    assert stt["response"]["transcript"] == "Thanks. That is all I needed. Goodbye."
+    assert stt["response"]["final_segments"] == 3
+
+
+async def test_a_committed_utterance_never_absorbs_the_next_one(recorder):
+    """Once LiveKit commits the message, the next final starts a new turn."""
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_input_transcribed", transcript("first", True))
+    session.emit("conversation_item_added", chat_item("user", "first"))
+    session.emit("user_input_transcribed", transcript("second", True))
+    session.emit("conversation_item_added", chat_item("user", "second"))
+    await rec.finish()
+    stt_ops = [e for e in operations(read_events(_dir(rec))) if e["type"] == "stt"]
+    assert len({op["turn_id"] for op in stt_ops}) == 2
+
+
+async def test_an_answered_turn_never_absorbs_the_next_utterance(recorder):
+    """A turn that already has a reply is finished collecting the caller."""
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_input_transcribed", transcript("first", True))
+    # Frames, not a metric: `speech_created` clears the pending turn, so audio
+    # arriving on its own is the way a still-pending turn can already have
+    # spoken -- and a turn that has spoken is done collecting the caller.
+    rec.tap_output_frame(agent_frame(2000))
+    session.emit("user_input_transcribed", transcript("second", True))
+    await rec.finish()
+    stt_ops = [e for e in operations(read_events(_dir(rec))) if e["type"] == "stt"]
+    assert len({op["turn_id"] for op in stt_ops}) == 2
+
+
+async def test_a_reply_the_caller_talks_past_keeps_its_utterance_whole(recorder):
+    """The shape a real LiveKit call actually produces.
+
+    LiveKit answers a *provisional* end of turn, so it creates a reply speech
+    after every final transcript and cancels the ones the caller talks past.
+    Only the last attempt survives to say anything. Recorded naively that is
+    three turns: two whose caller was never answered, and one reply with no
+    question -- which is what a live call produced before this.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_input_transcribed", transcript("Thanks.", True))
+    session.emit("speech_created", speech_created(SimpleNamespace(id="cancelled-1")))
+    session.emit("user_input_transcribed", transcript("That is all I needed.", True))
+    session.emit("speech_created", speech_created(SimpleNamespace(id="cancelled-2")))
+    session.emit("user_input_transcribed", transcript("Goodbye.", True))
+    session.emit("speech_created", speech_created(SimpleNamespace(id="spoken")))
+    session.emit("conversation_item_added",
+                 chat_item("user", "Thanks. That is all I needed. Goodbye."))
+    session.emit("metrics_collected", llm_metrics("spoken"))
+    rec.tap_output_frame(agent_frame(2000))
+    session.emit("metrics_collected", tts_metrics("spoken"))
+    await rec.finish()
+
+    ops = operations(read_events(_dir(rec)))
+    stt_ops = [op for op in ops if op["type"] == "stt"]
+    assert len(stt_ops) == 1, "the caller's one message was recorded as several turns"
+    llm_ops = [op for op in ops if op["type"] == "llm"]
+    assert llm_ops[0]["turn_id"] == stt_ops[0]["turn_id"], \
+        "the reply landed in a different turn from the question it answered"
+    stt = _by_type(rec, "stt")
+    assert stt["response"]["transcript"] == "Thanks. That is all I needed. Goodbye."
+
+
+async def test_a_filler_between_the_commit_and_the_next_final_keeps_turns_apart(recorder):
+    """The commit is reported against the current turn, not the collecting one.
+
+    A `say()` spoken between the caller's message and its commit makes its own
+    turn current, so the commit lands there. The caller's message is committed
+    all the same, and whatever they say next is a new turn.
+    """
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_input_transcribed", transcript("first", True))
+    session.emit("speech_created", speech_created(SimpleNamespace(id="filler"), source="say"))
+    session.emit("conversation_item_added", chat_item("user", "first"))
+    session.emit("user_input_transcribed", transcript("second", True))
+    await rec.finish()
+    stt_ops = [op for op in operations(read_events(_dir(rec))) if op["type"] == "stt"]
+    assert len({op["turn_id"] for op in stt_ops}) == 2

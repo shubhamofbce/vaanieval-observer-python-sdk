@@ -41,6 +41,13 @@ is yours, absent entirely it is the automatic answer. Framework replies now join
 the turn that follows them rather than the one before, because every internal
 route answers something already under way.
 
+"Inside the `livekit` package" means the namespace package's own search path,
+not just `livekit/agents`: plugins are separate distributions sharing that
+directory, so matching only `agents` would have read a plugin's own call as
+yours. The comparison keeps a trailing separator, so a project directory named
+`livekit_helpers` beside `livekit` is not taken for a package inside it — that
+mistake would have dropped the caveat from a reply you asked for.
+
 Verified across eight routes against a real `AgentSession` on livekit-agents
 1.7.0, including a bound method saved before recording started and a caller
 compiled inside the `livekit` package.

@@ -4145,17 +4145,19 @@ def public_generate_reply(monkeypatch, tmp_path):
     (root / "voice").mkdir(parents=True)
     monkeypatch.setattr(livekit_integration, "_GENERATE_REPLY_CODE",
                         FakeAgentSession.generate_reply.__code__)
-    monkeypatch.setattr(livekit_integration, "_LIVEKIT_ROOT",
-                        str(root.parent.resolve()))
+    monkeypatch.setattr(livekit_integration, "_LIVEKIT_ROOTS",
+                        (os.path.join(str(root.parent.resolve()), ""),))
 
-    def framework_caller(session, **kwargs):
+    def framework_caller(session, _from=None, **kwargs):
         """A call to the public method made from inside the installed package."""
         source = "def call(session, kwargs):\n    return session.generate_reply(**kwargs)\n"
         namespace: dict = {}
-        path = str((root / "voice" / "agent_activity.py").resolve())
+        default = root / "voice" / "agent_activity.py"
+        path = str((_from or default).resolve())
         exec(compile(source, path, "exec"), namespace)
         return namespace["call"](session, kwargs)
 
+    framework_caller.package_root = root.parent
     return framework_caller
 
 
@@ -4417,6 +4419,89 @@ async def test_attaching_the_same_recorder_twice_does_not_record_the_call_twice(
     assert len(stt) == 1, "the same utterance was recorded once per subscription"
     assert stt[0]["response"]["transcript"] == "hello", (
         "the caller's words were doubled by a second copy of the handler"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_livekit_plugin_asking_for_a_reply_is_not_the_application(
+        recorder, public_generate_reply):
+    """`livekit` is a namespace package, and plugins are separate packages in it.
+
+    Matching only the `livekit/agents` directory read a plugin's own call to
+    `generate_reply` as the application's -- a detached turn under a caveat,
+    with the caller's question one turn behind it. That is the same
+    misattribution stack inspection replaced, so the whole namespace path is
+    what a LiveKit-owned caller is matched against.
+    """
+    plugin = public_generate_reply.package_root / "plugins" / "openai" / "llm.py"
+    plugin.parent.mkdir(parents=True)
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("What is the fare?", True))
+    session.emit("conversation_item_added", chat_item("user", "What is the fare?"))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("filler-1"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("And to Boston?", False))
+    public_generate_reply(session, _from=plugin, input_modality="audio",
+                          handle_id="answer-2")
+    session.emit("metrics_collected", tts_metrics("answer-2", audio_duration=2.0))
+    rec.tap_output_frame(agent_frame(2000))
+    session.emit("user_input_transcribed", transcript("And to Boston?", True))
+    session.emit("conversation_item_added", chat_item("user", "And to Boston?"))
+    await rec.finish()
+
+    ops = operations(read_events(_dir(rec)))
+    llm = next(op for op in ops if op["type"] == "tts"
+               and op["response"].get("audio_ms") == 2000)
+    first = next(op for op in ops if op["type"] == "stt"
+                 and "What is the fare?" in (op["response"].get("transcript") or ""))
+    assert llm["turn_id"] != first["turn_id"]
+    assert llm["response"].get("reply_attribution") is None, (
+        "a plugin's own call was reported as the application's guesswork"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_project_directory_beside_the_package_is_still_the_application(
+        recorder, public_generate_reply):
+    """`livekit_helpers/` sits beside `livekit/` and its path starts the same.
+
+    Comparing the caller's filename against a root with no trailing separator
+    made every module whose directory merely *began* with the package path read
+    as LiveKit's own -- and a reply the application asked for was then placed
+    with no caveat at all, which is the one outcome the caveat exists to
+    prevent.
+    """
+    root = public_generate_reply.package_root
+    beside = root.parent / (root.name + "_helpers") / "replies.py"
+    beside.parent.mkdir(parents=True)
+    rec = recorder()
+    session = FakeAgentSession()
+    rec.attach(session)
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("What is the fare?", True))
+    session.emit("conversation_item_added", chat_item("user", "What is the fare?"))
+    session.emit("speech_created",
+                 speech_created(FakeSpeechHandle("filler-1"), source="say"))
+    session.emit("metrics_collected", tts_metrics("filler-1", audio_duration=0.4))
+    rec.tap_output_frame(agent_frame(400))
+    session.emit("user_state_changed", SimpleNamespace(new_state="speaking"))
+    session.emit("user_input_transcribed", transcript("And to Boston?", False))
+    public_generate_reply(session, _from=beside, input_modality="audio",
+                          handle_id="answer-2")
+    session.emit("metrics_collected", tts_metrics("answer-2", audio_duration=2.0))
+    rec.tap_output_frame(agent_frame(2000))
+    await rec.finish()
+
+    llm = next(op for op in operations(read_events(_dir(rec)))
+               if op["type"] == "tts" and op["response"].get("audio_ms") == 2000)
+    assert llm["response"].get("reply_attribution") == "inferred", (
+        "an application module beside the package was taken for the framework"
     )
 
 

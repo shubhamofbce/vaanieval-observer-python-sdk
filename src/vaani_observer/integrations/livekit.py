@@ -449,7 +449,35 @@ def _set_metering_scope(response: Dict[str, Any]) -> None:
 
 
 _GENERATE_REPLY_CODE: Any = None
-_LIVEKIT_ROOT: Optional[str] = None
+_LIVEKIT_ROOTS: tuple = ()
+
+
+def _livekit_roots() -> tuple:
+    """Every directory a LiveKit-owned caller can live in.
+
+    `livekit` is a namespace package: `livekit.agents` and every
+    `livekit.plugins.*` are separate distributions sharing one directory. Using
+    only the `agents` directory would have read a plugin's own call to
+    `generate_reply` as the application's, which is the same misattribution this
+    replaced -- so the namespace's own search path is asked, and the `agents`
+    directory is added in case a build lays it out somewhere else.
+
+    Each root keeps a trailing separator, so a project directory named
+    `livekit_helpers` next to `livekit` is not mistaken for a package under it.
+    """
+    roots = []
+    for module, attribute in (("livekit", "__path__"),
+                              ("livekit.agents", "__file__")):
+        try:
+            found = sys.modules.get(module) or __import__(module, fromlist=["_"])
+            value = getattr(found, attribute, None)
+            entries = ([str(entry) for entry in value] if attribute == "__path__"
+                       else ([os.path.dirname(str(value))] if value else []))
+            for entry in entries:
+                roots.append(os.path.join(os.path.abspath(entry), ""))
+        except Exception:  # noqa: BLE001 - a missing layout is not fatal
+            continue
+    return tuple(dict.fromkeys(roots))
 
 
 def _reply_call_site(depth_limit: int = 60) -> Optional[str]:
@@ -473,14 +501,13 @@ def _reply_call_site(depth_limit: int = 60) -> Optional[str]:
     the stack at all -- which is the automatic answer, since that reaches
     `_generate_reply` directly without passing through the public one.
     """
-    global _GENERATE_REPLY_CODE, _LIVEKIT_ROOT
+    global _GENERATE_REPLY_CODE, _LIVEKIT_ROOTS
     if _GENERATE_REPLY_CODE is None:
         try:
             from livekit.agents.voice.agent_session import AgentSession
-            import livekit.agents as _lk
 
             _GENERATE_REPLY_CODE = AgentSession.generate_reply.__code__
-            _LIVEKIT_ROOT = os.path.dirname(os.path.abspath(_lk.__file__))
+            _LIVEKIT_ROOTS = _livekit_roots()
         except Exception:  # noqa: BLE001 - version drift is survivable
             _GENERATE_REPLY_CODE = False
     if not _GENERATE_REPLY_CODE:
@@ -497,7 +524,7 @@ def _reply_call_site(depth_limit: int = 60) -> Optional[str]:
             if caller is None:
                 return "application"
             origin = os.path.abspath(caller.f_code.co_filename)
-            if _LIVEKIT_ROOT and origin.startswith(_LIVEKIT_ROOT):
+            if any(origin.startswith(root) for root in _LIVEKIT_ROOTS):
                 return "framework"
             return "application"
         frame = frame.f_back

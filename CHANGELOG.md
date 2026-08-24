@@ -4,6 +4,89 @@ Every recorded package stamps its SDK version into the manifest, so the version
 here is what a bug report is tied back to. Entries describe what changed about
 *the data* — a fix that alters no recorded value is not worth an adopter's time.
 
+## 0.5.2
+
+A tenth review pass, this time aimed squarely at how a reply's owner is
+decided. It found that the mechanism introduced in 0.5.1 was wrong in both
+directions, and two smaller defects of the same silent kind. No field changed
+meaning, hence the patch bump.
+
+### Attribution reads the stack instead of replacing a method
+
+0.5.1 identified a reply your own code asked for by replacing
+`session.generate_reply` and counting calls to the replacement. Two things
+defeat that.
+
+An application that saved the bound method before recording started — `reply =
+session.generate_reply` at setup, or any wrapper holding its own reference —
+called straight past the replacement. Its reply was then read as the automatic
+answer and merged into whichever turn a filler was holding open, with no caveat:
+the token counts and cost of a reply that may have answered nothing were charged
+to the caller's question, and nothing on the record said so.
+
+The other direction is more common. LiveKit calls its own public method in six
+places on 1.7.0: committing a realtime turn (`agent_activity.py:1693`), retrying
+a structured output (`run_result.py:292`), answering an asynchronous tool result
+(`tool_executor.py:599`), the IVR activity (`ivr_activity.py:53`, `:83`) and
+`agent.py:346`. Every one of those was reported as *your* reply — given its own
+turn, under a caveat, with the caller's final transcript opening yet another
+turn after it, so the question and its answer sat two turns apart.
+
+The stack is the one thing a captured reference cannot change: the same code
+object runs either way, and `speech_created` is emitted synchronously inside the
+call, so the frame that asked is still live. The recorder walks the stack for
+`AgentSession.generate_reply` and classifies by the filename of the frame above
+it — inside the `livekit` package the reply is the framework's own, outside it
+is yours, absent entirely it is the automatic answer. Framework replies now join
+the turn that follows them rather than the one before, because every internal
+route answers something already under way.
+
+Verified across eight routes against a real `AgentSession` on livekit-agents
+1.7.0, including a bound method saved before recording started and a caller
+compiled inside the `livekit` package.
+
+### Recording a call twice no longer doubles the caller's words
+
+`attach()` called twice — which a restart, a retry or a defensive `attach()` in
+two places all produce — registered every handler a second time. One final
+transcript then ran the handler twice and the turn published the caller's words
+doubled, `"hello hello"` for one `"hello"`, while the manifest reported the
+capture complete. Anything read from the transcript, including an evaluation of
+what the caller asked for, was wrong with no sign of it. `attach()` is now
+idempotent per session; because `finish()` unsubscribes, a session reused for a
+second call is still recorded in full.
+
+### A tool result that wants no reply no longer claims a later one
+
+The flag saying a tool result is owed a reply was set when tools ran and cleared
+only when a reply arrived. A result needing none — `StopResponse`, or any result
+whose `reply_required` is false — left it set indefinitely, so an unrelated
+barge-in minutes later was filed as the answer to that tool call, on the wrong
+turn, under a caveat that made it look considered. The flag now honours
+`has_tool_reply` (`events.py:447`) and otherwise expires after the same five
+seconds LiveKit itself waits for the reply (`agent_activity.py:4278`).
+
+### A call whose halves point at each other keeps its turns
+
+A package claiming turn A continues turn B *and* turn B continues turn A
+satisfied "my parent is present" in both directions, so both halves were
+subtracted and the call was stored as ready with no turns at all — which also
+hid it from the unmeasured-call check, since that only looks at calls with
+turns. A cycle has no first half, so neither row is treated as a continuation
+now: the call keeps both exchanges and reads them as separate, which is the
+honest answer for a package that cannot say which came first. The rule that
+decides this also lived in four places, and the session rail and the call page
+disagreed about that call; they now share one function.
+
+### A stage that skipped the middle half still says it ran twice
+
+Whether a stage was measured twice within one split exchange was answered by
+comparing each half against the half before it. An exchange split twice whose
+middle half carries only the caller's words — no reply is owed yet, so no model
+runs — is true of no adjacent pair, so the panel showed "2 measured, 1 turn in
+range" with nothing to reconcile them. The question is about the whole exchange
+and is now asked of the whole exchange.
+
 ## 0.5.1
 
 An eighth review pass over the 0.5.0 fixes. One release-blocking defect: a
@@ -34,8 +117,13 @@ Two routes emit an event identical in *every* field to the automatic answer, so
 they are settled by what the recorder observed rather than by what the event
 says. A reply your own code asked for is recognised because the call is still on
 the stack: `AgentSession.generate_reply()` reaches `speech_created` synchronously
-(`agent_session.py:1508-1520`), so counting entries to that method identifies its
-own replies whatever `input_modality` it was given. And `user_initiated=False`
+(`agent_session.py:1508-1520`), so the frame that asked for the reply is still
+live when the recorder sees it. The recorder walks the stack for that method and
+reads the filename of the frame above it — inside the `livekit` package the
+reply is the framework's own, outside it is yours, and absent entirely it is the
+automatic answer, which never passes through the public method at all. This
+holds whatever `input_modality` the call was given, and whether or not your code
+saved the bound method before recording started. And `user_initiated=False`
 covers both a realtime reply to speech being transcribed now *and* the automatic
 reply after a tool result, which answers the turn that ran the tool; those are
 told apart by whether the current turn has a tool result still owed a reply,
@@ -60,8 +148,10 @@ metric, the audio stream or the next speech needs the turn first, because
 waiting on the loop alone would have made attribution depend on arrival order,
 and an operation already written cannot be moved.
 
-Verified against real `SpeechHandle` and `SpeechCreatedEvent` objects on
-livekit-agents 1.7.0, and against 1.6.10 source, in all six directions.
+Verified against a real `AgentSession` and real `SpeechHandle` and
+`SpeechCreatedEvent` objects on livekit-agents 1.7.0, and against 1.6.10 source,
+in all eight directions — including a bound method saved before recording
+started, and a caller inside the `livekit` package itself.
 
 ### The attribution caveat now means what it says
 

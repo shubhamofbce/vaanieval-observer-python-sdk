@@ -330,7 +330,7 @@ class _TurnState:
         self.filler_speech_id: Optional[str] = None
         # How LiveKit created this turn's reply, or `None` while it has no
         # reply at all. Decides which provider stages this turn could ever be
-        # the claimant for. marker:r9-reply-source
+        # the claimant for.
         self.reply_source: Optional[str] = None
         # How many `tts_node` generators are still able to render for this
         # reply. A span closed while one is open publishes a duration shorter
@@ -385,8 +385,6 @@ def _set_metering_scope(response: Dict[str, Any]) -> None:
     left every consumer to rediscover the convention and do the subtraction. So
     the classification is published too. The amount is never altered: a
     connection meter is still the number the provider will invoice.
-
-    marker:r12-metering-scope
     """
     total = response.get("provider_metered_audio_ms")
     if not total:
@@ -417,7 +415,6 @@ def _is_unanswered_turn(state: "_TurnState", allow_filler: bool = True) -> bool:
     # it -- but it must stop being adoptable the moment the *next* caller starts
     # talking, or their preemptively generated reply is adopted backwards into
     # the previous caller's turn and the two exchanges are recorded as one.
-    # marker:r12-filler-not-across-callers
     filler_only = (allow_filler and state.reply_source == "say"
                    and not state.llm and not state.tools)
     return (
@@ -626,7 +623,7 @@ class VaaniLiveKitRecorder:
             # only on a rule hit. Leaving them on with an empty rule set is how
             # an adopter concludes "auto HTTP capture is broken" when in fact it
             # was never asked to capture anything.
-            #
+
             # Defaults are deliberately *not* shipped. A rule of type "llm"
             # pointed at api.openai.com would open a second LLM operation
             # alongside the one derived from `metrics_collected`, double-counting
@@ -808,7 +805,7 @@ class VaaniLiveKitRecorder:
         # never be resolved now, and its buffers would otherwise be held for
         # as long as the recorder is. Its audio is already in the call total,
         # so dropping the reference loses no measurement -- the audit reports
-        # it as unattributed, which is what it is. marker:r9-release-on-finish
+        # it as unattributed, which is what it is.
         self._unpinned_streams.clear()
         self._preemptive_turn = None
         self._collecting_turn = None
@@ -1004,7 +1001,7 @@ class VaaniLiveKitRecorder:
         # because we know exactly where these milliseconds went -- reporting
         # them as missing would flag healthy calls and teach an operator to
         # ignore the one status that means a number is really absent.
-        #
+
         # Two limits, because the per-turn floor is the wrong shape for a
         # question whose answer is a sum. A turn is only eligible if nothing
         # about it looks like a real reply -- words taped off `tts_node` mean
@@ -1036,19 +1033,17 @@ class VaaniLiveKitRecorder:
             # excuse exactly the class of bug this allowance keeps being asked
             # to cover.
             if s.tts is not None and not s.publication_snapshot_taken:
-                # marker:r8-no-writeoff-without-publication
                 # A span exists but was ended without publishing what it
                 # accounted for -- the error path ends operations directly and
                 # does exactly that. `published_played_ms` is then zero, which
                 # reads as "this reply published nothing, so all of its audio
                 # is post-publication residual" and forgives a whole reply's
                 # worth of speech that no span accounts for.
-                #
+
                 # A turn with no span at all is different and stays eligible:
                 # that is the drain tail this allowance was written for, where
                 # nothing was published because there was nothing to publish.
                 continue
-            # marker:r7-residual-post-publish
             # The *post-publication* unscoped audio, not the turn's lifetime
             # total: audio tapped before the span closed is already counted in
             # `played_ms` and cannot be part of this residual. Using the total
@@ -1179,7 +1174,7 @@ class VaaniLiveKitRecorder:
         # told an operator to go looking for audio that was never there, and a
         # gap payload that says `unattributed_agent_audio_ms: 0` in the same
         # breath is precisely the confidently-wrong reporting this status
-        # exists to avoid. marker:r9-silent-reply
+        # exists to avoid.
         # "Silent" means no audio at all, not "less audio than the tolerance":
         # a reply that spoke briefly still lost a real measurement, and the
         # tolerance exists for boundary jitter, not for deciding whether a
@@ -1470,7 +1465,6 @@ class VaaniLiveKitRecorder:
             # handed to a tapped agent ended with `agent_audio_tapped: True`,
             # which suppressed the never-tapped gap, and `agent_tap_lost: False`
             # -- so a call missing its whole first agent certified as complete.
-            # marker:r12-tap-missing-either-order
             self._agent_tap_missing = True
             return
         self._agent_audio_tapped = True
@@ -1504,7 +1498,6 @@ class VaaniLiveKitRecorder:
             return
         state.audio_bytes += count
         if stream is None or stream.ownership_inferred:
-            # marker:r8-mark-at-credit
             # Marked where the audio is actually credited, so the flag reports
             # attribution that happened rather than attribution that might.
             self._mark_ownership_inferred()
@@ -1652,7 +1645,6 @@ class VaaniLiveKitRecorder:
         # final recorded the same exchange as three: two showing the caller
         # talking to an agent that never answered, and per-turn latency
         # averages diluted by turns that never had a reply to measure.
-        # marker:r11-merge-finals
         carry = self._collecting_turn
         if (carry is not None
                 and not carry.user_committed
@@ -1672,7 +1664,6 @@ class VaaniLiveKitRecorder:
         # two -- and per-turn latency and answer attribution stop matching the
         # framework's history from here. That is a real cost, so it is recorded
         # rather than left for someone to discover in an average.
-        # marker:r12-split-recorded
         continues = (carry.id if (carry is not None
                                   and not carry.user_committed
                                   and carry.stt is not None
@@ -1742,7 +1733,6 @@ class VaaniLiveKitRecorder:
         # provider reported *before* the final -- the ordinary case for anything
         # that meters mid-utterance -- so a turn showed metered seconds and no
         # tokens, and the two numbers could never be reconciled.
-        # marker:r12-tokens-before-final
         for _key in ("input_tokens", "output_tokens"):
             _value = pending.metrics.get(_key)
             if _value is not None:
@@ -1792,7 +1782,7 @@ class VaaniLiveKitRecorder:
             )
             _set_metering_scope(response)
         # Summed for the same reason as the audio: each segment of a merged
-        # turn was charged separately. marker:r12-tokens-before-final
+        # turn was charged separately.
         for _key in ("input_tokens", "output_tokens"):
             _value = pending.metrics.get(_key)
             if _value is not None:
@@ -1831,13 +1821,12 @@ class VaaniLiveKitRecorder:
             # spoken *at* them -- "let me look that up" -- not an answer to it.
             # Letting it take the pending turn bills its audio to their question
             # and leaves the real reply in a turn with no question in it.
-            #
+
             # Once LiveKit has ended that message a `say()` is the opposite
             # case: an agent that answers with a scripted line and raises
             # StopResponse produces no generated reply at all, so refusing it
             # here would record every scripted answer detached from its
             # question.
-            # marker:r12-filler-not-pending
             state = None
         if state is not None and state.reply_source is not None:
             # The pending turn already has a reply speech bound to it. That can
@@ -1858,7 +1847,6 @@ class VaaniLiveKitRecorder:
             # that message no longer collecting -- so the rest of what they said
             # would be recorded as a second turn, answered by the reply to the
             # first half.
-            # marker:r11-supersede
             carry = self._collecting_turn
             if (carry is not None
                     and source == "generate_reply"
@@ -1889,7 +1877,6 @@ class VaaniLiveKitRecorder:
             # Recording it as its own turn splits one exchange in two: the
             # user's words in a turn with no reply, the reply in a turn with no
             # question, and no defensible latency between them.
-            # marker:r9-preemptive
             reuse = self._preemptive_turn
             if reuse is not None and _is_empty_turn(reuse):
                 # A discarded preemptive attempt is cancelled and regenerated
@@ -1913,7 +1900,6 @@ class VaaniLiveKitRecorder:
         # play on this turn and both are the caller's to hear, so they stay on
         # one span -- but the total stops being a single opaque number that
         # reads as the answer's own duration.
-        # marker:r12-filler-before-answer
         # Gating this on the filler's metrics having already arrived was a race
         # we lost routinely: `say()` emits `speech_created` synchronously and
         # only then schedules its TTS task (agent_activity.py:1435), so a
@@ -1930,7 +1916,7 @@ class VaaniLiveKitRecorder:
             # (tts.py:683) and LiveKit reports each as it finalises, so a filler
             # straddling the answer's creation had only the segments that had
             # already landed snapshotted here -- and the rest were silently
-            # added to the answer's share. marker:r12-filler-by-speech
+            # added to the answer's share.
             state.filler_speech_id = getattr(state.speech_handle, "id", None)
             if spoken:
                 state.tts_response["filler_audio_ms"] = spoken
@@ -2004,7 +1990,6 @@ class VaaniLiveKitRecorder:
         before LiveKit dispatches the `speech_created` for it. Its stream named
         this speech from the first frame, so nothing about it was ever
         ambiguous -- it was only waiting for the turn to exist.
-        marker:r9-resolve-deferred
         """
         for deferred in self._unpinned_streams.pop(speech_id, []):
             self._pin_stream(deferred, state)
@@ -2016,7 +2001,7 @@ class VaaniLiveKitRecorder:
         window is provably owned -- it carries the speech id -- so the only
         question is when the turn appears, and until this existed the answer
         was "when the next frame arrives", which for a reply that has already
-        finished rendering is never. marker:r9-defer
+        finished rendering is never.
         """
         if stream.speech_id is None:
             return
@@ -2038,7 +2023,7 @@ class VaaniLiveKitRecorder:
         # Resolved, so stop holding it for a `speech_created` that has either
         # already arrived or is no longer needed. Without this a stream pinned
         # by a later frame stays in the waiting map -- with its buffered text
-        # -- for the rest of the call. marker:r9-release
+        # -- for the rest of the call.
         waiting = self._unpinned_streams.get(stream.speech_id or "")
         if waiting is not None:
             if stream in waiting:
@@ -2078,7 +2063,7 @@ class VaaniLiveKitRecorder:
             # is timing, and a reply's own tail draining past the next reply's
             # start is credited to the wrong one -- so the call may not claim
             # its per-turn audio was proved.
-            return self._rendering_turn()  # marker:r8-streamturn-plain
+            return self._rendering_turn()
         if stream.owner is not None:
             return stream.owner
         if stream.speech_id is not None:
@@ -2130,7 +2115,6 @@ class VaaniLiveKitRecorder:
         """
         if stream.pending_bytes:
             if stream.ownership_inferred:
-                # marker:r8-flush-marks
                 self._mark_ownership_inferred()
             owner.audio_bytes += stream.pending_bytes
             stream.pending_bytes = 0
@@ -2351,7 +2335,7 @@ class VaaniLiveKitRecorder:
             # under both -- doubling talk time and cost -- and the second one
             # would close as `cancelled`, which the dashboard counts as a
             # barge-in on a turn that was never interrupted.
-            #
+
             # Applies to measured spans as well as derived ones. A genuinely
             # multi-segment turn loses the later segments' provider counts,
             # which is a real cost, but it is a gap rather than a number that
@@ -2419,7 +2403,6 @@ class VaaniLiveKitRecorder:
         # is the least forgivable direction for this number to be wrong in.
         segment_audio_ms = _ms(getattr(metrics, "audio_duration", None))
         # A segment belonging to the filler is the filler's, whenever it lands.
-        # marker:r12-filler-by-speech
         if (segment_audio_ms is not None
                 and state.filler_speech_id is not None
                 and getattr(metrics, "speech_id", None) == state.filler_speech_id):
@@ -2484,7 +2467,6 @@ class VaaniLiveKitRecorder:
         # worse than not billing it at all: it is wrong in a direction nothing
         # downstream can detect. If nobody has spoken on the pending span yet,
         # the usage belongs to the turn that just closed.
-        # marker:r12-usage-after-final
         pending = self._pending_stt
         untouched = (pending.started_at_ms is None
                      and pending.first_partial_at_ms is None
@@ -2509,7 +2491,7 @@ class VaaniLiveKitRecorder:
             # while an utterance-metering one (OpenAI, plugins/openai/stt.py:895)
             # puts real speech here. Nothing in the payload distinguishes them,
             # so rather than guess we publish the subtractable amount and let
-            # the consumer decide. marker:r12-metered-after-final-ms
+            # the consumer decide.
             if metered is not None:
                 response["metered_after_final_ms"] = (
                     (response.get("metered_after_final_ms") or 0) + metered
@@ -2564,7 +2546,6 @@ class VaaniLiveKitRecorder:
             # between the last final and the commit makes its own turn current,
             # and routing the commit there left the caller's turn still
             # collecting -- so their *next* message was merged into it.
-            # marker:r12-commit-to-collector
             state = self._collecting_turn or self._current_turn
             resolved_exactly = True
         if state is None:
@@ -2617,7 +2598,7 @@ class VaaniLiveKitRecorder:
             # `forwarded_text` -- the words that reached the caller, not the
             # words the LLM produced -- so on an interrupted reply it is the
             # truthful record of what was heard.
-            #
+
             # The character count is recorded whether or not content capture is
             # on, because "we saw 179 characters go by" is a fact worth keeping
             # even under a policy that forbids storing them.
@@ -2628,7 +2609,6 @@ class VaaniLiveKitRecorder:
                 # honestly reported both durations reported only half the
                 # speech -- and `char_count`, which is kept even when content
                 # capture is off, understated by the same amount.
-                # marker:r12-filler-words-kept
                 merge = bool(state.tts_response.get("reply_includes_filler"))
                 prior = state.tts_response.get("text") if self._capture_transcripts else None
                 # `text in prior` means this item has already been recorded --
@@ -2663,7 +2643,7 @@ class VaaniLiveKitRecorder:
         # ended the TTS span almost immediately and, worse, left every
         # subsequent frame of that reply belonging to no open turn at all: a
         # 49s call attributed 6.5s of the 33s the agent actually spoke.
-        #
+
         # The turn is instead marked complete and retired when the reply is
         # superseded (`speech_created`) or the call ends, by which time the
         # whole reply has been rendered and can be measured.
@@ -2703,7 +2683,7 @@ class VaaniLiveKitRecorder:
             # agent's own words -- the audit's second headline defect -- are
             # dropped for exactly the replies most likely to matter, the ones
             # the caller interrupted.
-            #
+
             # Retiring is only about *attribution*: frames now follow
             # `_speaking_turn`, which the caller reassigns immediately after
             # this, so leaving the span open costs nothing in accuracy. The
@@ -2774,7 +2754,6 @@ class VaaniLiveKitRecorder:
             # plausible owners and the text has to decide -- seen live as one
             # sentence captioning two turns, the shorter of which had only said
             # "let me check that for you".
-            # marker:r12-filler-not-the-speaker
             filler_over_answer = (
                 state.reply_source == "say"
                 and prior is not None
@@ -2807,7 +2786,7 @@ class VaaniLiveKitRecorder:
                 # reply's transcript and a `reply_complete` it has not earned
                 # -- a fabricated turn next to a mute one, from a single event
                 # arriving a few milliseconds late.
-                #
+
                 # Only taken when the live speech could have proved the item
                 # was its own and did not -- see `_can_disprove_ownership`.
                 # Without that negative proof this branch guesses, and because
@@ -3296,18 +3275,18 @@ class VaaniLiveKitRecorder:
         # emit the measurement is not evidence of ambiguity, and counting it
         # as one refuses metrics that were never in doubt.
         claimants = [s for s in self._all_turns
-                     if self._could_emit(s, stage)]  # marker:r9-eligible
+                     if self._could_emit(s, stage)]
         live = [s for s in claimants if not s.finished]
         candidate = live[0] if len(live) == 1 else None
         if candidate is not None and any(
                 t is not candidate and t.finished
                 and t.finished_at_seq >= candidate.seq
-                for t in claimants):  # marker:r8-no-tolerance
+                for t in claimants):
             # A reply ended at or after this one started, so a metric arriving
             # now is at least as likely to be its trailing measurement as this
             # turn's. There is no unambiguous answer -- only a coin flip that
             # would be published as fact.
-            #
+
             # "It already received a metric" is not the exemption it looks
             # like. `llm` and `tts` metrics are *additive*: one reply emits one
             # per synthesis segment or per tool-call round, and `_record_tts`
@@ -3316,13 +3295,13 @@ class VaaniLiveKitRecorder:
             # disagreement is also wide enough to hide a short segment, and a
             # barged-in reply reports more synthesized audio than it played, so
             # it looks complete no matter how much is missing.
-            #
+
             # The cost is real -- the reply loses a provider character count,
             # and cost is billed off that -- but the span survives, rebuilt
             # from the tape and marked estimated, and the gap says what was
             # lost. The alternative is a character count on the wrong reply,
             # which is a wrong invoice that looks exactly like a right one.
-            #
+
             # Worth being clear about when this happens at all: LiveKit stamps
             # `speech_id` from its own speech-handle context, so a metric
             # arrives unnamed only when the framework that owns the speech
@@ -3336,13 +3315,12 @@ class VaaniLiveKitRecorder:
             # Nothing is open: this is a trailing metric for the reply that
             # just ended, and `_record_tts`/`_record_llm` already recognise and
             # disclose a metric that arrives after its span was published.
-            #
+
             # Eligibility is re-checked here and not only above. "No eligible
             # reply is open" does not make the turn that happens to be current
             # a legal home -- a say() greeting following a generated reply is
             # exactly that shape, and it collected the reply's tokens, latency
             # and cost as a measured span on a turn where no model ever ran.
-            # marker:r9-fallback-eligible
             return self._current_turn
         self._unidentified_metrics[stage] = self._unidentified_metrics.get(stage, 0) + 1
         self._warn_once(
@@ -3387,7 +3365,7 @@ class VaaniLiveKitRecorder:
             # inflate the denominator of every TTS rate, and the ones that
             # close as `cancelled` are counted by the dashboard as barge-ins,
             # re-inflating the exact metric this round was asked to fix.
-            #
+
             # A reply cut off before its text was committed, or one generated
             # before the first user turn, emits neither `TTSMetrics` nor
             # `conversation_item_added` -- so nothing ever opened a span for
@@ -3395,7 +3373,7 @@ class VaaniLiveKitRecorder:
             # frames. Left alone this is the audit's headline defect in
             # miniature: real agent speech, no TTS operation, and every latency
             # and cost number computed as though it never happened.
-            #
+
             # Derived here rather than in `_finish_turn` because a turn still
             # open when the call ends is closed by `finalize_open_spans`
             # instead, and the last reply of a call is exactly the one most
@@ -3416,10 +3394,10 @@ class VaaniLiveKitRecorder:
         # `audio_ms` and the taped bytes measure two different things, and
         # conflating them is how a reader ends up trusting a number that is not
         # what they think it is:
-        #
+
         #   audio_ms  -- what the TTS provider says it synthesized.
         #   played_ms -- what actually flowed through `tts_node` to the caller.
-        #
+
         # On an interrupted reply the second is legitimately smaller, and that
         # gap is the useful part: it is how much of the answer the caller never
         # heard. Reporting only one of them, or silently overwriting one with
@@ -3465,7 +3443,7 @@ class VaaniLiveKitRecorder:
             # is the multi-segment case where only one segment's `TTSMetrics`
             # arrived: on a live call a 5670ms reply carried `audio_ms: 3040`,
             # a 46% undercount of the billable quantity.
-            #
+
             # Both numbers stay -- `audio_ms` is still what the invoice will be
             # based on -- but the disagreement is published rather than left for
             # a reader to notice by dividing two fields. Silence here is how a
@@ -3495,7 +3473,7 @@ class VaaniLiveKitRecorder:
             # call, arbitrarily so. Ending it at the extent of the audio that
             # actually played keeps the timeline bar the length of the reply
             # instead of the length of the silence that followed it.
-            #
+
             # This *overrides* any window carried on `tts_ended_at`, because
             # for a derived span that window came from `conversation_item_added`
             # -- which fires when the reply's text commits, measured at ~0.6s
@@ -3506,7 +3484,7 @@ class VaaniLiveKitRecorder:
             # published as a 4.4s span, with every synthesis-rate and
             # cost-per-second figure computed from it wrong by the same factor,
             # and nothing on the page to say so.
-            #
+
             # The frames are a direct measurement of what flowed to the caller
             # and are counted until the reply is superseded, so they are both
             # the later and the better evidence. An interrupted reply is
@@ -3519,7 +3497,7 @@ class VaaniLiveKitRecorder:
             # synthesis finished -- and Deepgram synthesizes far faster than
             # realtime, so the caller is still listening well after that. On a
             # live call this published a 3080ms greeting as a 2318ms span.
-            #
+
             # A span whose duration is shorter than the audio it says it played
             # is not defensible on a page an operator uses to answer "how long
             # was my agent talking": the timeline bar contradicts the number
@@ -3537,7 +3515,7 @@ class VaaniLiveKitRecorder:
         # audit that decides whether a turn counts as attributed.
         state.published_played_ms = response.get("played_ms") or 0
         state.unscoped_audio_bytes_at_publish = state.unscoped_audio_bytes
-        state.publication_snapshot_taken = True  # marker:r8-publish-flag
+        state.publication_snapshot_taken = True
         state.tts.end(status=status, response=response, ended_at_ms=ended_at)
 
     def _finish_turn(self, state: _TurnState) -> None:

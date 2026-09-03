@@ -1,4 +1,25 @@
-# Vaani Observer — Python SDK
+# Vaani Observer for Python
+
+> Local-first observability for real-time voice agents.
+
+Capture the STT, LLM, TTS, tool, WebSocket, and audio activity behind a voice
+call without putting a network dependency on its live media path. Vaani
+Observer writes a portable session package locally, then uploads it explicitly
+after the call for review in the [Vaani Observer Dashboard](https://github.com/shubhamofbce/vaanieval-observer-backend).
+
+![Vaani Observer dashboard](docs/images/dashboard-overview.png)
+
+## What you get
+
+- Provider-neutral operation spans and streaming milestones for STT, LLM, TTS,
+  tools, and connection lifetimes.
+- Timeline-aligned caller and agent audio, recorded as stereo PCM.
+- Safe ambient instrumentation: only traffic inside an active session that
+  matches your configured endpoint rules is observed.
+- A byte-compatible package format shared with the
+  [Node.js SDK](https://github.com/shubhamofbce/vaanieval-observer-nodejs-sdk).
+
+## Quick start
 
 Local-first Python observability for voice-agent calls. It writes a portable
 session package (`manifest.json`, `events.jsonl`, `call.audio`) to disk and
@@ -10,7 +31,7 @@ The package format is identical to the
 [dashboard](https://github.com/shubhamofbce/vaanieval-observer-backend) ingests
 calls from either runtime without knowing which produced them.
 
-## Local use
+## Instrument a call
 
 ```python
 from vaani_observer import VaaniObserver
